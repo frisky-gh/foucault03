@@ -1,0 +1,23 @@
+replace retry_time=\d+
+replace	chunk="[0-9a-fA-F]{4,}"
+replace	chunk_id="[0-9a-fA-F]{4,}"
+replace Authorization=\[Basic\s[-/\w]+=*\]
+replace error="pattern\snot\smatch\swith\sdata\s'.*'"
+replace record=\{".*"}
+replace object:[0-9a-f]+
+
+replace	(\d+\.\d+\.\d+\.\d+)
+
+replace \d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}\s[-+]\d{4}
+
+replace (0x[0-9a-f]+)
+replace	([0-9a-f]{4,}-[0-9a-f]{4,})
+replace	(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})
+replace	(?:(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})
+
+replace	(\d{2,}\.\d+)
+replace	(\d{2,})		\d+
+
+replace	([fF]{4,})		[0-9a-fA-F]{4,}
+
+

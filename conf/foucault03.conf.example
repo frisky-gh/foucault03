@@ -1,0 +1,22 @@
+
+#### ignore
+ignore apache.**
+
+#### multilinelog -> singlelinelog
+
+multiline2singleline oracle.alert.**
+	firstline ^(Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s(Jun|Feb|Mar|Apr|May|Jun|Jul|Aug|Nov|Oct|Sep|Dec)\s+\d+\s\d{2}:\d{2}:\d{2}\s\d{4}
+multiline2singleline oracle.trace.**
+	firstline ^(Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s(Jun|Feb|Mar|Apr|May|Jun|Jul|Aug|Nov|Oct|Sep|Dec)\s+\d+\s\d{2}:\d{2}:\d{2}\s\d{4}
+
+#### singlelinelog -> apicalllog / anomalylog / unmonitoredlog
+
+anomalymonitor fluent.**
+	pattern fluent
+
+anomalymonitor syslog.**
+	pattern syslog
+
+
+
+

@@ -1,0 +1,25 @@
+---
+
+- hosts: all
+  tasks:
+    - name: "foucault03 crontab setup"
+      cron:
+        user: td-agent
+        name: "foucault03 cleanup batch"
+        minute: "02"
+        job: "{{SERVICEHOME}}/bin/foucaultcron cleanup"
+
+    - name: "foucault03 crontab setup"
+      cron:
+        user: td-agent
+        name: "foucault03 prepare batch"
+        minute: "*/10"
+        job: "{{SERVICEHOME}}/bin/foucaultcron prepare"
+
+    - name: "foucault03 crontab setup"
+      cron:
+        user: td-agent
+        name: "foucault03 deliverflash batch"
+        minute: "*/10"
+        job: "{{SERVICEHOME}}/bin/foucaultcron deliverflash"
+

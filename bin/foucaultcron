@@ -1,0 +1,462 @@
+#!/usr/bin/perl
+
+use strict;
+use JSON;
+use Template;
+use Encode;
+use MIME::EncWords ':all';
+
+our $SPOOLDIR = "/opt/foucault03/spool";
+our $ANOMALYLOGDIR = "/opt/foucault03/anomalylog";
+our $DELIVEREDEVENTDIR   = "/opt/foucault03/deliveredevent";
+our $UNDELIVEREDEVENTDIR = "/opt/foucault03/undeliveredevent";
+our $STATUSDIR = "/opt/foucault03/status";
+our $CONFDIR = "/opt/foucault03/conf";
+
+our $SENDMAILEXE = '/usr/lib/sendmail';
+our $MAILFROM = 'foucault03@example.com';
+
+####
+sub read_conf () {
+	my $f = "$CONFDIR/foucaultmessenger.conf";
+	open my $h, '<', $f or do {
+		die "$f: cannot open, stopped";
+	};
+	my @categories;
+	my @recipients;
+	my $directive;
+	my @errors;
+	while( <$h> ){
+		chomp;
+		next if m"^\s*(#|$)";
+		unless( m"^\s*(
+			category	\s+ (?<category>    \S.*) |
+			    tagmatch	\s+ (?<tagmatch>    \S.*) |
+			    eventmatch	\s+ (?<eventmatch>  \S.*) |
+			    type	\s+ (?<type>        \S.*) |
+			    reciever	\s+ (?<reciever>    \S.*) |
+			recipient	\s+ (?<recipient>   \S.*) |
+			    maxsize     \s+ (?<maxsize>     \S.*) |
+			    mininterval	\s+ (?<mininterval> \S.*)
+		)$"x ){
+			push @errors, "$f:$.: illegal format.\n";
+			next;
+		}
+	
+		if    ( $+{category} ){
+			$directive = {
+				name        => $+{category},
+				type        => undef,
+				tagregexp   => qr".*",
+				eventregexp => qr".*",
+				recievers   => [],
+				maxsize     => 1000,
+				mininterval => 30,
+			};
+			push @categories, $directive;
+		}elsif( $+{recipient} ){
+			$directive = {
+				name        => $+{recipient},
+			};
+			push @recipients, $directive;
+		}elsif( $+{tagmatch} ){
+			$directive->{tagregexp} = qr"$+{tagmatch}";
+		}elsif( $+{eventmatch} ){
+			$directive->{eventregexp} = qr"$+{eventmatch}";
+		}elsif( $+{type} ){
+			$directive->{type} = $+{type};
+		}elsif( $+{reciever} ){
+			push @{$directive->{recievers}}, $+{reciever};
+		}elsif( $+{maxsize} ){
+			$directive->{maxsize} = $+{maxsize};
+		}elsif( $+{mininterval} ){
+			$directive->{mininterval} = $+{mininterval};
+		}else{
+			die;
+		}
+	}
+	close $h;
+
+	if( @errors ){
+		foreach my $error ( @errors ){
+			print STDERR $error, "\n";
+		}
+		die;
+	}
+	return {
+		categories  => [@categories],
+		recipients  => [@recipients],
+		errors	    => [@errors],
+	};
+}
+
+####
+sub get_logstatus ($$) {
+	my ($dir, $regexp) = @_;
+	my $status = {};
+	opendir my $d, $dir or do {
+		die "$dir: cannot open, stoped";
+	};
+	while( my $e = readdir $d ){
+		next if $e =~ m"^\.";
+		next unless $e =~ m"^$regexp$";
+		next unless -f "$dir/$e";
+		my ($dev, $inode, $mode, $nlink, $uid, $gid, $rdev, $size) =
+			stat "$dir/$e";
+		$status->{$e} = {"size" => $size};
+	}
+	close $d;
+	return $status;
+}
+
+sub load_logstatus ($) {
+	my ($statusname) = @_;
+	my $f = "$STATUSDIR/logstatus.$statusname";
+	open my $h, '<', $f or return {};
+	my $status = {};
+	while( <$h> ){
+		chomp;
+		my ($file, $size) = split m"\t";
+		$status->{$file} = {size => $size};
+	}
+	close $h;
+	return $status;
+}
+
+sub store_logstatus ($$) {
+	my ($statusname, $status) = @_;
+	my $f = "$STATUSDIR/logstatus.$statusname";
+	my $g = "$STATUSDIR/.logstatus.$statusname";
+	open my $h, '>', $g or do {
+		die "$g: cannot open, stoped";
+	};
+	foreach my $file ( sort {$a cmp $b} keys %$status ){
+		my $values = $status->{$file};
+		print $h join("\t", $file, $values->{size}), "\n";
+	}
+	close $h;
+
+	unlink $f if -f $f;
+	rename $g, $f or do {
+		die "$f: cannot open, stoped";
+	}
+}
+
+sub read_partial ($$$) {
+	my ($file, $offset, $length)= @_;
+	my $buff;
+	open my $h, '<', $file or do {
+		die "$file: cannot open, stopped";
+	};
+	seek $h, $offset, 0;
+	read $h, $buff, $length;
+	close $h;
+	return $buff;
+}
+
+sub read_incremental ($$$&) {
+	my ($dir, $statusname, $regexp, $handler) = @_;
+	my $laststatus = load_logstatus $statusname;
+	my $currstatus = get_logstatus $dir, $regexp;
+	
+	while( my ($file, $currvalues) = each %$currstatus ){
+		my $lastvalues = $laststatus->{$file} || {'size' => 0};
+		my $currsize = $currvalues->{"size"};
+		my $lastsize = $lastvalues->{"size"};
+		next if $currsize == $lastsize;
+		$lastsize = 0 if $currsize < $lastsize;
+		my $offset = $lastsize;
+		my $length = $currsize - $lastsize;
+		my $partial = read_partial "$dir/$file", $offset, $length;
+		&$handler( $file, $partial );
+	}
+
+	store_logstatus $statusname, $currstatus;
+}
+
+####
+sub remove_old ($$$) {
+	my ($dir, $regexp, $limit) = @_;
+	my $now = time;
+	opendir my $d, $dir or do {
+		die "$dir: cannot open, stoped";
+	};
+	my @remove;
+	while( my $e = readdir $d ){
+		next if $e =~ m"^\.";
+		next unless $e =~ $regexp;
+		next unless -f "$dir/$e";
+		my ($dev, $inode, $mode, $nlink, $uid, $gid, $rdev, $size,
+		    $atime, $mtime, $ctime, $blksize, $blocks) =
+			stat "$dir/$e";
+		next unless $mtime + $limit < $now;
+		push @remove, $e;
+	}
+	close $d;
+	foreach my $e ( @remove ){
+		unlink "$dir/$e";
+	}
+}
+
+####
+sub open_and_append_message ($$$$$) {
+	my ($tag2event2fh, $prefix, $tag, $event, $message) = @_;
+
+	my $fh = $tag2event2fh->{$tag}->{$event};
+	unless( $fh ){
+		open $fh, '>>', "$prefix$tag+$event" or do {
+			die "$prefix$tag: cannot open, stopped";
+		};
+		$tag2event2fh->{$tag}->{$event} = $fh;
+	}
+	print $fh $message, "\n";
+}
+
+sub close_all ($) {
+	my ($tag2event2fh) = @_;
+	foreach my $event2fh ( values %$tag2event2fh ){
+		foreach my $fh ( values %$event2fh ){
+			close $fh;
+		}
+	}
+}
+
+####
+sub load_lastsend ($) {
+	my ($name) = @_;
+	my $f = "$STATUSDIR/lastsend.$name";
+	open my $h, '<', $f or return 0;
+	my $time = <$h>;
+	close $h;
+	return $time + 0;
+}
+
+sub store_lastsend ($$) {
+	my ($name, $time) = @_;
+	my $f = "$STATUSDIR/lastsend.$name";
+	open my $h, '>', $f or do {
+		die "$f: cannot open, stoped";
+	};
+	print $h $time, "\n";
+	close $h;
+}
+
+####
+sub generate_snippet ($) {
+	my ($tag2event2messages) = @_;
+
+	my $full;
+	my $digest;
+	my $summary;
+	foreach my $tag ( sort keys %$tag2event2messages ){
+		my $event2messages = $tag2event2messages->{$tag};
+		foreach my $event ( sort keys %$event2messages ){
+			my $messages = $event2messages->{$event};
+
+			$full    .= sprintf "%s %s\n", $tag, $event;
+			$digest  .= sprintf "%s %s\n", $tag, $event;
+			$full   .= "________________________________________\n";
+			$digest .= "________________________________________\n";
+			my $n = 0;
+			foreach my $message ( @$messages ){
+				++$n;
+				$full   .= "$message\n";
+				$digest .= "$message\n" if $n < 3;
+			}
+			$digest .= "(...snipped)\n" unless $n < 3;
+			$full   .= "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n";
+			$digest .= "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n";
+			$summary .= sprintf "%s %s (%d)\n", $tag, $event, $n;
+		}
+	}
+	$full =~ s{[-+.\w]+\@[-.\w]+\.[-\w]+}{XXXX\@XXXXX.XXX}g;
+	$digest =~ s{[-+.\w]+\@[-.\w]+\.[-\w]+}{XXXX\@XXXXX.XXX}g;
+	return $full   if length($full) < 20000;
+	return $digest if length($digest) < 20000;
+	return $summary;
+}
+
+####
+sub sendmail ($$$) {
+	my ($mail, $mailfrom, $mailto) = @_;
+	my $from_quoted = quotemeta $mailfrom;
+	my $to_quoted = quotemeta $mailto;
+
+	open my $h, '|-', "$SENDMAILEXE -f $from_quoted $to_quoted" or do {
+		die "$SENDMAILEXE: cannot execute, stopped";
+	};
+	chomp $mail;
+	my @mail = split m"\n", $mail;
+	while( 1 ){
+		$_ = shift @mail;
+		last if $_ eq '';
+
+		my $text = encode_mimewords $_, Encoding => 'b', Charset => 'utf-8';
+		print $h encode_utf8($text), "\n";
+	}
+	print $h "MIME-Version: 1.0\n";
+	print $h "Content-Transfer-Encoding: 8bit\n";
+	print $h "Content-Type: text/plain; charset=utf-8\n",
+		"\n";
+	while( 1 ){
+		$_ = shift @mail;
+		last unless defined $_;
+		my $text = decode_utf8( $_ );
+		print $h encode_utf8($text), "\n";
+	}
+	close $h;
+}
+
+####
+sub subcmd_cleanup ($) {
+	my ($conf) = @_;
+	remove_old
+		$SPOOLDIR, 
+		qr"^singlelinelog\..*$",
+		90 * 60;
+	remove_old
+		$ANOMALYLOGDIR, 
+		qr"^anomalylog\..*$",
+		36 * 60 * 60;
+}
+
+sub subcmd_prepare ($) {
+	my ($conf) = @_;
+	my $categories = $conf->{categories};
+	my $recipients = $conf->{recipients};
+	my $decoder = JSON->new;
+	my ($sec, $min, $hour, $day, $mon, $year) = localtime time;
+	my $today = sprintf "%04d-%02d-%02d", $year+1900, $mon+1, $day;
+
+	my $tag2event2fh = {};
+	read_incremental
+		$ANOMALYLOGDIR,
+		"prepare",
+		qr"^anomalylog\..*$",
+		sub {
+			my ($file, $diff) = @_;
+			foreach my $r ( split m"\n+", $diff ){
+				next if $r eq '';
+				my $obj = $decoder->decode( $r );
+				my $tag = $obj->{tag};
+				my $event = $obj->{event};
+				my $message = $obj->{message};
+				$tag =~ s{^anomalylog\.}{};
+				$tag =~ s{\.\d{4}-\d{2}-\d{2}_\d{2}:\d{2}(\.\d+)?$}{};
+
+				my $delivery_is_planned;
+				foreach my $category ( @$categories ){
+					my $tagregexp = $category->{tagregexp};
+					my $eventregexp = $category->{eventregexp};
+					next unless $tag =~ m"^$tagregexp$";
+					next unless $event =~ m"^$eventregexp$";
+					$delivery_is_planned = 1;
+					last;
+				}
+				if( $delivery_is_planned ){
+					open_and_append_message $tag2event2fh,
+						"$DELIVEREDEVENTDIR/deliveredevent.$today.",
+						$tag, $event, $message;
+				}else{
+					open_and_append_message $tag2event2fh,
+						"$UNDELIVEREDEVENTDIR/undeliveredevent.$today.",
+						$tag, $event, $message;
+				}
+			}
+		};
+	close_all $tag2event2fh;
+
+	exit 0;
+}
+
+sub subcmd_deliverflash ($) {
+	my ($conf) = @_;
+	my $categories = $conf->{categories};
+	my $recipients = $conf->{recipients};
+
+	my $now = time;
+	foreach my $category ( @$categories ){
+		my $type = $category->{type};
+		next unless $type eq 'flash';
+
+		my $name = $category->{name};
+		my $mininterval = $category->{mininterval};
+		my $maxsize = $category->{maxsize};
+		my $lastsend = load_lastsend $name;
+		next unless $lastsend + $mininterval*60 < $now;
+
+		my $tagregexp = $category->{tagregexp};
+		my $eventregexp = $category->{eventregexp};
+		my $message_exists;
+		my %tag2event2messages;
+		read_incremental
+			$DELIVEREDEVENTDIR,
+			"deliverflash.$name",
+			qr"^deliveredevent\.\d{4}-\d{2}-\d{2}\.$tagregexp\+$eventregexp$",
+			sub {
+				my ($file, $diff) = @_;
+				$file =~ m"^deliveredevent\.(\d{4}-\d{2}-\d{2})\.([^+]+)\+(.*)$" or die;
+				my $date = $1;
+				my $tag = $2;
+				my $event = $3;
+				my @messages;
+				foreach my $message ( split m"\n+", $diff ){
+					next if $message eq '';
+					push @messages, $message;
+				}
+				return unless @messages;
+				push @{$tag2event2messages{$tag}->{$event}}, @messages;
+				$message_exists = 1;
+			};
+
+		next unless $message_exists;
+
+		my $snippet = generate_snippet \%tag2event2messages;
+
+		my $recievers = $category->{recievers};
+		foreach my $reciever ( @$recievers ){
+			my $output;
+			my $tt = Template->new({
+				INCLUDE_PATH => $CONFDIR,
+				OUTPUT_PATH => $CONFDIR
+			});
+			my $var = {
+				MAILFROM => $MAILFROM,
+				MAILTO   => $reciever,
+				SNIPPET  => $snippet,
+			};
+			$tt->process( 'foucaultmessenger.tt', $var, \$output ) or do {
+				die $tt->error(), ", stopped";
+			};
+			sendmail $output, $MAILFROM, $reciever;
+			#print $output, $MAILFROM, $reciever, "\n";
+		}
+
+		store_lastsend $name, $now;
+	}
+	exit 0;
+}
+
+sub subcmd_deliverdaily ($) {
+	exit 0;
+}
+
+my $conf = read_conf;
+if    ( $ARGV[0] eq 'cleanup' ){
+	subcmd_cleanup $conf;
+}elsif( $ARGV[0] eq 'prepare' ){
+	subcmd_prepare $conf;
+}elsif( $ARGV[0] eq 'deliverflash' ){
+	subcmd_deliverflash $conf;
+}elsif( $ARGV[0] eq 'deliverdaily' ){
+	subcmd_deliverdaily $conf;
+}else{
+	print "usage: % $0 prepare\n";
+	exit 0;
+}
+
+
+exit 0;
+
+ 
+

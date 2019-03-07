@@ -1,0 +1,30 @@
+# for nullmailer
+replace queued.as.[0-9A-F]{11}	queued.as.[0-9A-F]{11}
+
+# for abrt
+replace \[[0-9a-f]{8,10}\+[0-9a-f]{6}\]
+replace ip\s[0-9a-f]{16}
+replace sp\s[0-9a-f]{16}
+replace \[[0-9a-f]+00\+[0-9a-f]+00\]
+replace [0-9a-f]{16}
+
+replace	(\d+\.\d+\.\d+\.\d+)
+
+replace	(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{6})?\+\d{2}:\d{2})					(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+\d{2}:\d{2}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\x20[\x200-9][0-9]\x20[\x200-9][0-9]:[0-9][0-9]:[0-9][0-9]|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}\+\d{2}:\d{2})
+replace	((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s[\s0-9][0-9]\s[\s0-9][0-9]:[0-9][0-9]:[0-9][0-9])											(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+\d{2}:\d{2}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\x20[\x200-9][0-9]\x20[\x200-9][0-9]:[0-9][0-9]:[0-9][0-9]|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}\+\d{2}:\d{2})
+
+replace	(?:\d{4}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2})
+replace	(?:\d{4}-\d{2}-\d{2}.\d{2}:\d{2}:\d{2}(?:[.:]\d{3})?)
+
+replace [0-9a-f]{32}
+
+replace (0x[0-9a-f]+)
+replace	([0-9a-f]{4,}-[0-9a-f]{4,})
+replace	(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})
+replace	(?:(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})
+
+replace	(\d{2,}\.\d+)
+replace	(\d{2,})		\d+
+
+replace	([fF]{4,})		[0-9a-fA-F]{4,}
+

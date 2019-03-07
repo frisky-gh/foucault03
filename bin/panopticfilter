@@ -1,0 +1,571 @@
+#!/usr/bin/perl
+
+use strict;
+use Time::Local;
+use Regexp::Assemble;
+use Getopt::Long qw(:config posix_default no_ignore_case gnu_compat);
+use JSON;
+use Encode;
+
+our $DEBUG;
+our $REGMARK;
+
+if( @ARGV < 1 ){
+	print "usage: % $0 <SUBCOMMAND>\n";
+	print "\n";
+	print "    SUBCOMMAND\n";
+	print "        build   Build a pattern file by specified rules from sample logs.\n";
+	print "                   -r FILE     rule file\n";
+	print "                   -o FILE     output pettern file\n";
+	print "                   -s FILE     input sample log file. You can specify\n";
+	print "                               multiple files.\n";
+	print "                   -d FILE     (optional) output diagnosis file\n";
+	print "                   -e NAME     (optional) event name. Default: 50WELKNOWN\n";
+	print "        run      Monitor anomaly logs from STDIN plain text.\n";
+	print "                   -p FILE     pettern file\n";
+	print "        filter   Monitor anomaly logs from STDIN JSON text.\n";
+	print "                   -p FILE     pettern file\n";
+	print "                   -e 's/x/y/' tag replacement rule.\n";
+	print "                   -o FILE     (optional) output anomaly log file\n";
+	print "        strip    Strip redundant sample logs from STDIN plain text.\n";
+	print "                   -r FILE     rule file\n";
+	print "                   -p FILE     (optional) pettern file\n";
+	print "        multiline2singleline\n";
+	print "                 Transform multi-line logs to single-line logs.\n";
+	print "                   --firstline REGEXP\n";
+	print "\n";
+	exit 1;
+}
+
+####
+
+our $OUTFILE;
+our $OUTFILE_CURR;
+our $OUTFILE_PERIOD;
+our $OUTFILE_MAXSIZE;
+our $OUTFILE_ORIGIN;
+our $OUTFILE_TZ;
+
+our $OUTHANDLE;
+our $MUST_REOPEN;
+
+sub get_timeperiodboundary () {
+	unless( defined $OUTFILE_TZ ){
+		my $gmnow = time;
+		$OUTFILE_TZ = timegm( localtime $gmnow ) - $gmnow;
+	}
+	my $now = time + $OUTFILE_TZ;
+	return int($now/$OUTFILE_PERIOD) * $OUTFILE_PERIOD - $OUTFILE_TZ;
+}
+
+sub get_outfilename () {
+	my $file = $OUTFILE;
+	$OUTFILE_ORIGIN = get_timeperiodboundary if $OUTFILE_PERIOD;
+	my ($sec, $min, $hour, $day, $mon, $year) = localtime $OUTFILE_ORIGIN;
+	$file =~ s{%([ymdHMS\%])}{
+		if    ( $1 eq 'y' ){ sprintf "%04d", $year + 1900;
+		}elsif( $1 eq 'm' ){ sprintf "%02d", $mon + 1;
+		}elsif( $1 eq 'd' ){ sprintf "%02d", $day;
+		}elsif( $1 eq 'H' ){ sprintf "%02d", $hour;
+		}elsif( $1 eq 'M' ){ sprintf "%02d", $min;
+		}elsif( $1 eq 'S' ){ sprintf "%02d", $sec;
+		}else{ '%';
+		}
+	}eg;
+	return $file;
+}
+
+sub reopen_outfile () {
+	if    ( not $OUTFILE and not $OUTHANDLE ){
+		$OUTHANDLE = *STDOUT;
+		$OUTHANDLE->autoflush;
+		return;
+	}elsif( not $OUTFILE ){
+		return;
+	}
+	my $f = get_outfilename;
+	unless( -f $f ){
+		$OUTFILE_CURR = $f;
+	}else{
+		for( my $i = 1; $i < 1000; $i++ ){
+			next if -f "$f.$i";
+			$OUTFILE_CURR = "$f.$i";
+			last;
+		}
+	}
+	open $OUTHANDLE, '>>', $OUTFILE_CURR or do {
+		die "$OUTFILE_CURR: cannot open, stopped";
+	};
+	$OUTHANDLE->autoflush;
+	$MUST_REOPEN = undef;
+}
+
+sub check_outfile () {
+	return if $MUST_REOPEN;
+
+	my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,
+	    $atime,$mtime,$ctime,$blksize,$blocks) = stat $OUTHANDLE;
+	if    ( $OUTFILE_PERIOD and
+		get_timeperiodboundary != $OUTFILE_ORIGIN ){
+		$MUST_REOPEN = 1;
+		close $OUTHANDLE;
+
+	}elsif( $OUTFILE_MAXSIZE and
+		$size > $OUTFILE_MAXSIZE ){
+		$MUST_REOPEN = 1;
+		close $OUTHANDLE;
+	}
+}
+
+$SIG{USR1} = sub {
+	return unless $OUTFILE;
+	return if $MUST_REOPEN;
+	$MUST_REOPEN = 1;
+	close $OUTHANDLE;
+};
+
+####
+sub timestamp ($) {
+	my ($time) = @_;
+	my ($sec, $min, $hour, $day, $mon, $year) = localtime $time;
+	return sprintf "%04d-%02d-%02d_%02d:%02d:%02d", $year+1900, $mon+1, $day, $hour, $min, $sec;
+}
+
+sub debuglog ($;@) {
+	my ($format, @args) = @_;
+	return unless $DEBUG;
+	my $timestamp = timestamp time;
+	my $text = sprintf $format, @args;
+	$text =~ s{([\x00-\x1f\x7e\\])}{ '\x' . unpack('H2', $1); }e;
+	print "$timestamp $text\n";
+}
+
+####
+sub read_rulefile ($) {
+	my ($conffile) = @_;
+	my $mark = "rule0000";
+	my %mark2replace;
+	my @res;
+	open my $h, '<', $conffile or die "$conffile: cannot open, stopped";
+	debuglog "$conffile: opened.";
+	while( <$h> ){
+		chomp;
+		s{^\s*}{}g;
+		next if m{^($|#)};
+		my @c = split m{\s+};
+		if( $c[0] eq 'replace' ){
+			my $re = $c[1];
+			my $replace = $c[2] // $re;
+			push @res, "$re(*:$mark)";
+			$mark2replace{$mark} = $replace;
+			$mark++;
+		}else{
+			print STDERR "$conffile:$.: $c[0]: syntax error.\n";
+			next;
+		}
+	}
+	close $h;
+	my $re = "(" . join("|", @res) . ")";
+
+	return qr"$re", %mark2replace;
+}
+
+sub quotemetaex ($) {
+	local $_ = shift;
+	s{([\x24\x28-\x2b\x2e\x3f\x5b-\x5e\x7b-\x7d])}{\\$1}g;
+	return $_;
+}
+
+sub generalize ($\%$) {
+	my ($rule_re, $mark2replace, $text) = @_;
+	my $pattern_entry;
+	while( $text =~ m"$rule_re"p ){
+		$pattern_entry .= quotemetaex ${^PREMATCH};
+		$pattern_entry .= $mark2replace->{$REGMARK};
+		$text = ${^POSTMATCH};
+	}
+	$pattern_entry .= quotemetaex $text;
+	return $pattern_entry;
+}
+
+sub read_samplefiles ($\%@) {
+	my ($rule_re, $mark2replace, @samplefiles) = @_;
+	my $ra = Regexp::Assemble->new;
+	my %patterns;
+	foreach my $samplefile ( @samplefiles ){
+		debuglog "generate_pattern: samplefile=%s.", $samplefile;
+		open my $h, '<', $samplefile or die "$samplefile: cannot open, stopped";
+		while( <$h> ){
+			chomp;
+			next if m"^\s*(#|$)";
+			my $pattern_fracture = generalize $rule_re, %$mark2replace, $_;
+			next if $patterns{$pattern_fracture};
+
+			eval { qr"$pattern_fracture"; };
+			if( $@ ){
+				print STDERR "$samplefile:$.: $pattern_fracture\n";
+				die "$samplefile:$.: cannot compile, stopped";
+				next;
+			}
+
+			$patterns{$pattern_fracture} = 1;
+			$ra->add( $pattern_fracture );
+		}
+		close $h;
+	}
+		
+	return $ra, \%patterns;
+}
+
+our $PATTERNFILE;
+our $PATTERNFILE_IS_UPDATED;
+our $PATTERNFILE_TIMESTAMP;
+sub read_patternfile () {
+	open my $h, '<', $PATTERNFILE or die "$PATTERNFILE: cannot open, stopped";
+	my $pattern = join '', <$h>;
+	my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,
+	    $atime,$mtime,$ctime,$blksize,$blocks) = stat $h;
+	$PATTERNFILE_IS_UPDATED = undef;
+	$PATTERNFILE_TIMESTAMP = $mtime;
+	close $h;
+	chomp $pattern;
+	return qr"^$pattern$";
+}
+
+sub set_patternfile_checker () {
+	$SIG{ALRM} = sub {
+		my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,
+		    $atime,$mtime,$ctime,$blksize,$blocks) = stat $PATTERNFILE;
+		$PATTERNFILE_IS_UPDATED = 1 if $mtime > $PATTERNFILE_TIMESTAMP;
+		check_outfile;
+		alarm 60;
+	};
+	alarm 60;
+}
+
+sub write_outputfile ($$) {
+	my ($outputfile, $pattern_re) = @_;
+	open my $h, '>', $outputfile or die "$outputfile: cannot open, stopped";
+	print $h $pattern_re, "\n";
+	close $h;
+}
+
+sub write_diagnosisfile ($\%) {
+	my ($diagnosisfile, $samplesmap) = @_;
+	open my $h, '>', $diagnosisfile or die "$diagnosisfile: cannot open, stopped";
+	foreach my $i ( sort keys %$samplesmap ){
+		my $samples = $samplesmap->{$i};
+		foreach my $j ( sort keys %$samples ){
+			print $h "$i\t$j\n";
+		}
+	}
+	close $h;
+}
+
+####
+sub cmd_build ($$$\%) {
+	my ($rulefile, $outputfile, $diagnosisfile, $samplefilemap) = @_;
+	my ($rule_re, %mark2replace) = read_rulefile $rulefile;
+	my %patternmap;
+	my %samples;
+	my @res;
+	foreach my $name ( sort keys %$samplefilemap ){
+		my $samplefiles = $samplefilemap->{$name};
+		my ($builded_re, $samples) = read_samplefiles $rule_re, %mark2replace, @$samplefiles;
+		push @res, "$builded_re(*:$name)";
+		$samples{$name} = $samples;
+	}
+	my $re = "(" . join("|", @res) . ")";
+	eval { qr"$re"; };
+	if( $@ ){
+		die;
+	}
+	
+	write_outputfile $outputfile, $re;
+	write_diagnosisfile $diagnosisfile, %samples if $diagnosisfile;
+	exit 0;
+}
+
+sub cmd_strip ($$) {
+	my ($rulefile, $patternfile) = @_;
+	$| = 1;
+	my ($rule_re, %mark2replace) = read_rulefile $rulefile;
+	$PATTERNFILE = $patternfile;
+	my $re = read_patternfile if defined $patternfile;
+	my %redundant;
+	while(<STDIN>){
+		chomp;
+		next if m"^\s*(#|$)";
+		next if $re and m"$re";
+
+		my $pattern_fracture = generalize $rule_re, %mark2replace, $_;
+		next if $redundant{$pattern_fracture};
+
+		eval { qr"$pattern_fracture"; };
+		if( $@ ){
+			print STDERR "$.: $pattern_fracture\n";
+			die "$.: cannot compile, stopped";
+		}
+
+		$redundant{$pattern_fracture} = 1;
+		print "$_\n";
+	}
+	exit 0;
+}
+
+sub cmd_run ($) {
+	my ($patternfile) = @_;
+	$| = 1;
+	$PATTERNFILE = $patternfile;
+	my $re = read_patternfile;
+	while( <STDIN> ){
+		chomp;
+		if( m"$re" ){
+			my $event = $REGMARK;
+			next if $event =~ m"WELLKNOWN";
+			print STDERR "$.:$event\n";
+		}else{
+			print STDERR "$.:ANOMALY\n";
+			print STDOUT "$_\n";
+		}
+	}
+	exit 0;
+}
+
+sub cmd_filter ($$$$$@) {
+	my ($patternfile, $informat, $intag, $outformat, $outtag, @sed) = @_;
+	$| = 1;
+	$PATTERNFILE = $patternfile;
+	my $re = read_patternfile;
+	my $codec = JSON->new;
+	$MUST_REOPEN = 1;
+	set_patternfile_checker;
+	while( <STDIN> ){
+		chomp;
+		my %var = %{ $codec->decode($_) };
+
+		$PATTERNFILE_IS_UPDATED and $re = read_patternfile;
+
+		my $message = encode('latin-1', $var{message});
+		if    ( $message eq "" ){
+			next;
+		}elsif( $message =~ m"$re" ){
+			my $event = $REGMARK;
+			next if $event =~ m"WELLKNOWN";
+			$var{event} = $event;
+		}else{
+			$var{event} = 'ANOMALY';
+		}
+
+		$_ = $var{$intag};
+		foreach my $sed ( @sed ){ $sed->(); }
+		$var{$outtag} = $_;
+
+		my $text = $codec->encode( \%var );
+		reopen_outfile if $MUST_REOPEN;
+		print $OUTHANDLE "$text\n";
+	}
+	exit 0;
+}
+
+sub cmd_ltsv2text ($) {
+	my ($fieldname) = @_;
+	$| = 1;
+	while( <STDIN> ){
+		chomp;
+		foreach my $field ( split m"\t+" ){
+			next unless $field =~ m"^([-.\w]+):(.*)$";
+			print "$2\n" if $1 eq $fieldname;
+		}
+	}
+	exit 0;
+}
+
+sub cmd_json2text ($) {
+	my ($fieldname) = @_;
+	$| = 1;
+	my $decoder = JSON->new;
+	while( <STDIN> ){
+		chomp;
+		eval {
+			my $v = $decoder->decode( $_ );
+			my $message = $v->{$fieldname};
+			print "$message\n" if defined $message;
+		};
+		if( $@ ){ print "ERROR: $@\n"; }
+	}
+	exit 0;
+}
+
+sub cmd_text2json ($) {
+	my ($fieldname) = @_;
+	$| = 1;
+	my $encoder = JSON->new;
+	while( <STDIN> ){
+		chomp;
+		my $message = $encoder->encode( { $fieldname => $_ } );
+		print "$message\n" if defined $message;
+	}
+	exit 0;
+}
+
+sub cmd_multiline2singleline ($) {
+	my ($firstline) = @_;
+	
+	$| = 1;
+	$MUST_REOPEN = 1;
+	set_patternfile_checker;
+	my $last;
+	while( <STDIN> ){
+		chomp;
+		if( m"$firstline" ){
+			if($last ne ""){
+				reopen_outfile if $MUST_REOPEN;
+				print $OUTHANDLE "$last\n";
+			}
+			$last = $_;
+		}else{
+			$last .= "\x1f" . $_;
+		}
+		if(length($last) > 1024*1024){
+			reopen_outfile if $MUST_REOPEN;
+			print $OUTHANDLE "$last\n";
+			$last = undef;
+		}
+	}
+	if($last ne ""){
+		reopen_outfile if $MUST_REOPEN;
+		print $OUTHANDLE "$last\n";
+	}
+	exit 0;
+}
+
+
+####
+my $cmd = shift @ARGV;
+if    ( $cmd eq 'build' ){
+	my $rulefile;
+	my $outputfile;
+	my $diagnosisfile;
+	my $eventname = '50WELLKNOWN';
+	my %samplefilemap;
+	GetOptions (
+		'rulefile|r=s'      => \$rulefile,
+		'outputfile|o=s'    => \$outputfile,
+		'diagnosisfile|d=s' => \$diagnosisfile,
+		'eventname|e=s'     => \$eventname,
+		'samplefile|f=s'    => sub {
+			push @{$samplefilemap{$eventname}}, $_[1];
+		},
+	) or die "Invalid command line options, stopped";
+	die unless defined $rulefile;
+	die unless defined $outputfile;
+	cmd_build $rulefile, $outputfile, $diagnosisfile, %samplefilemap;
+
+}elsif( $cmd eq 'run' ){
+	my $patternfile;
+	GetOptions (
+		'petternfile|p=s' => \$patternfile,
+	) or die "Invalid command line options, stopped";
+	die unless defined $patternfile;
+	cmd_run($patternfile);
+
+}elsif( $cmd eq 'filter' ){
+	my $patternfile;
+	my $informat  = 'json';
+	my $intag     = 'tag';
+	my $outformat = 'json';
+	my $outtag    = 'tag';
+	my @sed;
+	GetOptions (
+		'outfile|o=s'	  => \$OUTFILE,
+		'maxsize=i'	  => \$OUTFILE_MAXSIZE,
+		'period=i'	  => \$OUTFILE_PERIOD,
+		'petternfile|p=s' => \$patternfile,
+		'informat=s'      => \$informat,
+		'intag=s'         => \$intag,
+		'outformat=s'     => \$outformat,
+		'outtag=s'        => \$outtag,
+		'rename|e=s'      => sub {
+			my (undef, $sed) = @_;
+			unless( $sed =~ m"^s/[^/]*/[^/]*/\w*$" ){
+				die;
+			}
+			if( my $eval = eval <<"CODE" )
+				sub {
+#line 1
+				$sed;
+#line
+				}
+CODE
+			{ push @sed, $eval; }
+			else{
+				my $error = $@;
+				$error =~ s/\(eval\s+\d+\)/\(user-supplied code\)/g;
+				$error =~ s/\"[^#"]*\#line\s+1\n/"/;
+				$error =~ s/\n\#line\n[^#"]*\"/"/;
+				$error =~ s/\s*\z/\n/;
+				die $error;
+			}
+		},
+	) or die "Invalid command line options, stopped";
+	die unless defined $patternfile;
+	die unless @sed;
+	cmd_filter($patternfile, $informat, $intag, $outformat, $outtag, @sed);
+
+}elsif( $cmd eq 'ltsv2text' ){
+	my $fieldname = 'message';
+	GetOptions (
+		'fieldname=s' => \$fieldname,
+	) or die "Invalid command line options, stopped";
+	die unless defined $fieldname;
+	cmd_ltsv2text($fieldname);
+
+}elsif( $cmd eq 'json2text' ){
+	my $fieldname = 'message';
+	GetOptions (
+		'fieldname=s' => \$fieldname,
+	) or die "Invalid command line options, stopped";
+	die unless defined $fieldname;
+	cmd_json2text($fieldname);
+
+}elsif( $cmd eq 'text2json' ){
+	my $fieldname = 'message';
+	GetOptions (
+		'fieldname=s' => \$fieldname,
+	) or die "Invalid command line options, stopped";
+	die unless defined $fieldname;
+	cmd_text2json($fieldname);
+
+}elsif( $cmd eq 'multiline2singleline' ){
+	my $firstline;
+	GetOptions (
+		'outfile|o=s'	  => \$OUTFILE,
+		'maxsize=i'	  => \$OUTFILE_MAXSIZE,
+		'period=i'	  => \$OUTFILE_PERIOD,
+		'firstline=s' => \$firstline,
+	) or die "Invalid command line options, stopped";
+	die unless defined $firstline;
+	my $firstline_regexp = qr"$firstline";
+	cmd_multiline2singleline($firstline_regexp);
+
+}elsif( $cmd eq 'whyhit' ){
+}elsif( $cmd eq 'strip' ){
+	my $rulefile;
+	my $patternfile;
+	GetOptions (
+		'rulefile|r=s'   => \$rulefile,
+		'petternfile|p=s' => \$patternfile,
+	) or die "Invalid command line options, stopped";
+	die unless defined $rulefile;
+	cmd_strip($rulefile, $patternfile);
+}elsif( $cmd eq 'version' ){
+	print "0.0.1\n";
+	exit 0;
+}else{
+	die;
+}
+
+
+
+
