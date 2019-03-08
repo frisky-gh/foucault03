@@ -2,24 +2,40 @@
 
 - hosts: all
   tasks:
+    - name: install packages
+      yum:
+        name:
+          - perl-JSON-XS 
+          - perl-Regexp-Assemble
+          - perl-Template-Toolkit
+          - perl-MIME-EncWords
+          - td-agent
+
+    - name: td-agent setup
+      lineinfile:
+        dest:   /etc/td-agent/td-agent.conf
+        insertafter: EOF
+        regexp: "@include {{TOOLHOME}}"
+        line:   "@include {{TOOLHOME}}/conf/fluentd/fluentd_foucault03.conf"
+
     - name: "foucault03 crontab setup"
       cron:
         user: td-agent
         name: "foucault03 cleanup batch"
         minute: "02"
-        job: "{{SERVICEHOME}}/bin/foucaultcron cleanup"
+        job: "{{TOOLHOME}}/bin/foucaultcron cleanup"
 
     - name: "foucault03 crontab setup"
       cron:
         user: td-agent
         name: "foucault03 prepare batch"
         minute: "*/10"
-        job: "{{SERVICEHOME}}/bin/foucaultcron prepare"
+        job: "{{TOOLHOME}}/bin/foucaultcron prepare"
 
     - name: "foucault03 crontab setup"
       cron:
         user: td-agent
         name: "foucault03 deliverflash batch"
         minute: "*/10"
-        job: "{{SERVICEHOME}}/bin/foucaultcron deliverflash"
+        job: "{{TOOLHOME}}/bin/foucaultcron deliverflash"
 

@@ -1,29 +1,32 @@
 #!/usr/bin/perl
 
 use strict;
+use Cwd "abs_path";
 use JSON;
 use Template;
 use Encode;
 use MIME::EncWords ':all';
 
-our $SPOOLDIR = "/opt/foucault03/spool";
-our $ANOMALYLOGDIR = "/opt/foucault03/anomalylog";
-our $DELIVEREDEVENTDIR   = "/opt/foucault03/deliveredevent";
-our $UNDELIVEREDEVENTDIR = "/opt/foucault03/undeliveredevent";
-our $STATUSDIR = "/opt/foucault03/status";
-our $CONFDIR = "/opt/foucault03/conf";
+$0 =~ m"^(.*)/";
+our $TOOLHOME = abs_path( "$1/.." // '.' );
+our $CONFDIR             = "$TOOLHOME/conf";
+our $SPOOLDIR            = "$TOOLHOME/spool";
+our $STATUSDIR           = "$TOOLHOME/status";
+our $ANOMALYLOGDIR       = "$TOOLHOME/anomalylog";
+our $DELIVEREDEVENTDIR   = "$TOOLHOME/deliveredevent";
+our $UNDELIVEREDEVENTDIR = "$TOOLHOME/undeliveredevent";
 
 our $SENDMAILEXE = '/usr/lib/sendmail';
-our $MAILFROM = 'foucault03@example.com';
 
 ####
-sub read_conf () {
-	my $f = "$CONFDIR/foucaultmessenger.conf";
+sub read_deliver_conf () {
+	my $f = "$CONFDIR/deliver.conf";
 	open my $h, '<', $f or do {
 		die "$f: cannot open, stopped";
 	};
 	my @categories;
 	my @recipients;
+	my %param;
 	my $directive;
 	my @errors;
 	while( <$h> ){
@@ -37,7 +40,8 @@ sub read_conf () {
 			    reciever	\s+ (?<reciever>    \S.*) |
 			recipient	\s+ (?<recipient>   \S.*) |
 			    maxsize     \s+ (?<maxsize>     \S.*) |
-			    mininterval	\s+ (?<mininterval> \S.*)
+			    mininterval	\s+ (?<mininterval> \S.*) |
+			(?<paramname> MAILFROM) = (?<paramvalue> \S*)
 		)$"x ){
 			push @errors, "$f:$.: illegal format.\n";
 			next;
@@ -71,6 +75,8 @@ sub read_conf () {
 			$directive->{maxsize} = $+{maxsize};
 		}elsif( $+{mininterval} ){
 			$directive->{mininterval} = $+{mininterval};
+		}elsif( $+{paramname} ){
+			$param{ $+{paramname} } = $+{paramvalue};
 		}else{
 			die;
 		}
@@ -87,6 +93,7 @@ sub read_conf () {
 		categories  => [@categories],
 		recipients  => [@recipients],
 		errors	    => [@errors],
+		param       => {%param},
 	};
 }
 
@@ -373,6 +380,7 @@ sub subcmd_deliverflash ($) {
 	my ($conf) = @_;
 	my $categories = $conf->{categories};
 	my $recipients = $conf->{recipients};
+	my $mailfrom = $conf->{param}->{MAILFROM} // "foucault03\@example.com";
 
 	my $now = time;
 	foreach my $category ( @$categories ){
@@ -421,14 +429,14 @@ sub subcmd_deliverflash ($) {
 				OUTPUT_PATH => $CONFDIR
 			});
 			my $var = {
-				MAILFROM => $MAILFROM,
+				MAILFROM => $mailfrom,
 				MAILTO   => $reciever,
 				SNIPPET  => $snippet,
 			};
-			$tt->process( 'foucaultmessenger.tt', $var, \$output ) or do {
+			$tt->process( 'deliver_flash.tt', $var, \$output ) or do {
 				die $tt->error(), ", stopped";
 			};
-			sendmail $output, $MAILFROM, $reciever;
+			sendmail $output, $mailfrom, $reciever;
 			#print $output, $MAILFROM, $reciever, "\n";
 		}
 
@@ -441,7 +449,7 @@ sub subcmd_deliverdaily ($) {
 	exit 0;
 }
 
-my $conf = read_conf;
+my $conf = read_deliver_conf;
 if    ( $ARGV[0] eq 'cleanup' ){
 	subcmd_cleanup $conf;
 }elsif( $ARGV[0] eq 'prepare' ){

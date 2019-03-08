@@ -1,17 +1,23 @@
 #!/usr/bin/perl
 
 use strict;
+use Cwd "abs_path";
 use Template;
 
-our $CONFDIR = "/opt/foucault03/conf";
-our $BINDIR = "/opt/foucault03/bin";
-our $TMPDIR = "/opt/foucault03/tmp";
-our $LOGDIR = "/opt/foucault03/log";
-our $ANOMALYLOGDIR     = "/opt/foucault03/anomalylog";
-our $UNMONITOREDLOGDIR = "/opt/foucault03/unmonitoredlog";
-our $CAPTUREDLOGDIR    = "/opt/foucault03/capturedlog";
-our $MULTILINE2SINGLELINEDIR = "/opt/foucault03/multiline2singleline";
-our $FLUENTDCONFDIR = "/etc/td-agent/fj_conf.d";
+$0 =~ m"^(.*)/";
+our $TOOLHOME = abs_path( "$1/.." // '..' );
+our $CONFDIR                 = "$TOOLHOME/conf";
+our $BINDIR                  = "$TOOLHOME/bin";
+our $TMPDIR                  = "$TOOLHOME/tmp";
+our $SPOOLDIR                = "$TOOLHOME/spool";
+our $STATUSDIR               = "$TOOLHOME/status";
+our $LOGDIR                  = "$TOOLHOME/log";
+our $ANOMALYLOGDIR           = "$TOOLHOME/anomalylog";
+our $UNMONITOREDLOGDIR       = "$TOOLHOME/unmonitoredlog";
+our $CAPTUREDLOGDIR          = "$TOOLHOME/capturedlog";
+our $MULTILINE2SINGLELINEDIR = "$TOOLHOME/multiline2singleline";
+our $PATTERNSDIR             = "$TOOLHOME/conf/patterns";
+our $FLUENTDCONFDIR          = "$TOOLHOME/conf/fluentd";
 
 sub remove_wildcard ($) {
 	my @fields;
@@ -46,8 +52,8 @@ sub tag2anomalylogregexp ($) {
 	return qr"^$tag\.\d{4}-\d{2}-\d{2}(\.\d+)?$";
 }
 
-sub read_conf () {
-	my $f = "$CONFDIR/foucault03.conf";
+sub read_fluentd_conf () {
+	my $f = "$CONFDIR/fluentd.conf";
 	open my $h, '<', $f or do {
 		die "$f: cannot open, stopped";
 	};
@@ -93,18 +99,22 @@ sub read_conf () {
 				=> tag2anomalylogregexp $+{anomalymonitor},
 				inputlogregexp
 				=> tag2singlelinelogregexp $+{anomalymonitor},
+				pattern       => 'none',
+				patternfile   => "$PATTERNSDIR/none.pattern",
 			};
 			push @anomalymonitor, $directive;
 		}elsif( $+{firstline} ){
 			$directive->{firstline} = $+{firstline};
 		}elsif( $+{pattern} ){
+			my $f = "$PATTERNSDIR/$+{pattern}.pattern";
 			$directive->{pattern} = $+{pattern};
-			push @errors, "$CONFDIR/$+{pattern}.pattern: not found."
-				unless -f "$CONFDIR/$+{pattern}.pattern";
+			$directive->{patternfile} = $f;
+			push @errors, "$f: not found." unless -f $f;
 		}elsif( $+{command} ){
+			my $f = "$MULTILINE2SINGLELINEDIR/$+{command}";
 			$directive->{command} = $+{command};
-			push @errors, "$MULTILINE2SINGLELINEDIR/$+{command}.pl: not found."
-				unless -f "$MULTILINE2SINGLELINEDIR/$+{command}.pl";
+			$directive->{commandfile} = $f;
+			push @errors, "$f: not found." unless -f $f;
 		}else{
 			die;
 		}
@@ -119,7 +129,7 @@ sub read_conf () {
 	};
 }
  
-sub action_build_fluentdconf ($) {
+sub subcmd_build_fluentd_conf ($) {
 	my ($conf) = @_;
 
 	if( @{$conf->{errors}} ){
@@ -133,18 +143,23 @@ sub action_build_fluentdconf ($) {
 		ignore               => $conf->{ignore},
 		multiline2singleline => $conf->{multiline2singleline},
 		anomalymonitor       => $conf->{anomalymonitor},
+		PANOPTICFILTER       => "$BINDIR/panopticfilter",
+		SPOOLDIR             => $SPOOLDIR,
+		STATUSDIR            => $STATUSDIR,
+		ANOMALYLOGDIR        => $ANOMALYLOGDIR,
+		UNMONITOREDLOGDIR    => $UNMONITOREDLOGDIR,
 	};
 	my $tt = Template->new({
 		INCLUDE_PATH => $CONFDIR,
-		OUTPUT_PATH => $FLUENTDCONFDIR
+		OUTPUT_PATH => $FLUENTDCONFDIR,
 	});
-	$tt->process( 'foucault03.tt', $var, 'fluentd_foucault03.conf' ) or do {
+	$tt->process( 'fluentd.tt', $var, 'fluentd_foucault03.conf' ) or do {
 		die $tt->error(), ", stopped";
 	};
 	exit 0;
 }
 
-sub action_capture_anomalylog ($) {
+sub subcmd_capture_anomalylog ($) {
 	my ($conf) = @_;
 	
 	opendir my $d, $ANOMALYLOGDIR or do {
@@ -168,11 +183,11 @@ sub action_capture_anomalylog ($) {
 			next unless defined $pattern;
 			my $cmd;
 			$cmd .= "cat $ANOMALYLOGDIR/anomalylog.$anomalylog |";
-			$cmd .= " $BINDIR/panopticfilter filter -p $CONFDIR/$pattern.pattern -e 's///' |";
+			$cmd .= " $BINDIR/panopticfilter filter -p $PATTERNSDIR/$pattern.pattern -e 's///' |";
 			$cmd .= " grep ANOMALY |";
 			$cmd .= " $BINDIR/panopticfilter json2text |";
-			$cmd .= " $BINDIR/panopticfilter strip -r $CONFDIR/$pattern.rules";
-			$cmd .= " -p $CONFDIR/$pattern.pattern" if -f "$CONFDIR/$pattern.pattern";
+			$cmd .= " $BINDIR/panopticfilter strip -r $PATTERNSDIR/$pattern.rules";
+			$cmd .= " -p $PATTERNSDIR/$pattern.pattern" if -f "$PATTERNSDIR/$pattern.pattern";
 			$cmd .= " >> $CAPTUREDLOGDIR/capturedlog.$pattern";
 			system $cmd;
 			$matched = 1;
@@ -183,7 +198,7 @@ sub action_capture_anomalylog ($) {
 	exit 0;
 }
 
-sub action_capture_unmonitoredlog ($) {
+sub subcmd_capture_unmonitoredlog ($) {
 	my ($conf) = @_;
 
 	opendir my $d, $UNMONITOREDLOGDIR or do {
@@ -200,13 +215,13 @@ sub action_capture_unmonitoredlog ($) {
 	foreach my $m ( @{ $conf->{anomalymonitor} } ){
 		my $pattern = $m->{pattern};
 		next unless defined $pattern;
-		next if -f "$CONFDIR/$pattern.pattern";
+		next if -f "$PATTERNSDIR/$pattern.pattern";
 
 		my $cmd;
-		unless( -f "$CONFDIR/$pattern.rules" ){
-			$cmd .= "cp /opt/foucault03/conf/GENERIC.rules /opt/foucault03/conf/$pattern.rules ; ";
+		unless( -f "$PATTERNSDIR/$pattern.rules" ){
+			$cmd .= "cp $CONFDIR/rules.template $PATTERNSDIR/$pattern.rules ; ";
 		}
-		unless( -f "$CONFDIR/$pattern.sample" ){
+		unless( -f "$PATTERNSDIR/$pattern.sample" ){
 			my $regexp = $m->{inputlogregexp};
 			my @logs;
 			foreach my $unmonitoredlog ( @unmonitoredlog ){
@@ -215,7 +230,7 @@ sub action_capture_unmonitoredlog ($) {
 			}
 			if( @logs ){
 				$cmd .= "cat @logs |";
-				$cmd .= " $BINDIR/panopticfilter strip -r $CONFDIR/$pattern.rules";
+				$cmd .= " $BINDIR/panopticfilter strip -r $PATTERNSDIR/$pattern.rules";
 				$cmd .= " >> $CAPTUREDLOGDIR/capturedlog.$pattern";
 			}
 		}
@@ -224,7 +239,7 @@ sub action_capture_unmonitoredlog ($) {
 	exit 0;
 }
 
-sub action_import_capturedlog ($) {
+sub subcmd_import_capturedlog ($) {
 	my ($conf) = @_;
 	opendir my $d, $CAPTUREDLOGDIR or do {
 		die "$CAPTUREDLOGDIR: cannot open. stopped";
@@ -237,17 +252,17 @@ sub action_import_capturedlog ($) {
 	}
 	close $d;
 	foreach my $pattern ( @capturedlog ){
-		next unless -f "$CONFDIR/$pattern.rules";
+		next unless -f "$PATTERNSDIR/$pattern.rules";
 		my $cmd;
 		$cmd .= "cat $CAPTUREDLOGDIR/capturedlog.$pattern";
-		$cmd .= " >> $CONFDIR/$pattern.sample";
+		$cmd .= " >> $PATTERNSDIR/$pattern.sample";
 		$cmd .= " && rm $CAPTUREDLOGDIR/capturedlog.$pattern";
 		system $cmd;
 	}
 	exit 0;
 }
 
-sub action_show_capturedlog ($) {
+sub subcmd_show_capturedlog ($) {
 	my ($conf) = @_;
 	opendir my $d, $CAPTUREDLOGDIR or do {
 		die "$CAPTUREDLOGDIR: cannot open. stopped";
@@ -268,7 +283,7 @@ sub action_show_capturedlog ($) {
 	exit 0;
 }
 
-sub action_list_unmonitoredlog ($) {
+sub subcmd_list_unmonitoredlog ($) {
 	my ($conf) = @_;
 	
 	opendir my $d, $UNMONITOREDLOGDIR or do {
@@ -300,7 +315,7 @@ sub action_list_unmonitoredlog ($) {
 	exit 0;
 }
 
-sub action_strip_capturedlog ($) {
+sub subcmd_strip_capturedlog ($) {
 	my ($conf) = @_;
 	opendir my $d, $CAPTUREDLOGDIR or do {
 		die "$CAPTUREDLOGDIR: cannot open. stopped";
@@ -315,8 +330,8 @@ sub action_strip_capturedlog ($) {
 	foreach my $pattern ( sort @capturedlog ){
 		next unless -s "$CAPTUREDLOGDIR/capturedlog.$pattern";
 		my $cmd;
-		$cmd .= "$BINDIR/panopticfilter strip -r $CONFDIR/$pattern.rules";
-		$cmd .= " -p $CONFDIR/$pattern.pattern" if -f "$CONFDIR/$pattern.pattern";
+		$cmd .= "$BINDIR/panopticfilter strip -r $PATTERNSDIR/$pattern.rules";
+		$cmd .= " -p $PATTERNSDIR/$pattern.pattern" if -f "$PATTERNSDIR/$pattern.pattern";
 		$cmd .= " < $CAPTUREDLOGDIR/capturedlog.$pattern";
 		$cmd .= " > $CAPTUREDLOGDIR/stripedlog.$pattern ; ";
 		$cmd .= "mv $CAPTUREDLOGDIR/stripedlog.$pattern";
@@ -326,17 +341,17 @@ sub action_strip_capturedlog ($) {
 	exit 0;
 }
 
-sub action_strip_sample ($) {
+sub subcmd_strip_sample ($) {
 	my ($conf) = @_;
-	opendir my $d, $CONFDIR or do {
-		die "$CONFDIR: cannot open. stopped";
+	opendir my $d, $PATTERNSDIR or do {
+		die "$PATTERNSDIR: cannot open. stopped";
 	};
 	my @samples;
 	while( my $e = readdir $d ){
 		next if $e =~ m"^\.";
-		next unless -s "$CONFDIR/$e";
+		next unless -s "$PATTERNSDIR/$e";
 		next unless $e =~ m"^([-\w]+)(\+[-\w]+)?\.sample$";
-		next unless -f "$CONFDIR/$1.rules";
+		next unless -f "$PATTERNSDIR/$1.rules";
 		push @samples, {rules => $1, name => "$1$2"};
 	}
 	close $d;
@@ -344,11 +359,11 @@ sub action_strip_sample ($) {
 		my $name = $sample->{name};
 		my $rules = $sample->{rules};
 		my $cmd;
-		$cmd .= "$BINDIR/panopticfilter strip -r $CONFDIR/$rules.rules";
-		$cmd .= " < $CONFDIR/$name.sample";
-		$cmd .= " > $CONFDIR/$name.sample.new ; ";
-		$cmd .= "mv $CONFDIR/$name.sample.new";
-		$cmd .= " $CONFDIR/$name.sample";
+		$cmd .= "$BINDIR/panopticfilter strip -r $PATTERNSDIR/$rules.rules";
+		$cmd .= " < $PATTERNSDIR/$name.sample";
+		$cmd .= " > $PATTERNSDIR/$name.sample.new ; ";
+		$cmd .= "mv $PATTERNSDIR/$name.sample.new";
+		$cmd .= " $PATTERNSDIR/$name.sample";
 		system $cmd;
 	}
 	exit 0;
@@ -361,26 +376,26 @@ sub get_mtime ($) {
 	return $mtime;
 }
 
-sub action_build_pattern () {
-	opendir my $d, $CONFDIR or do {
-		die "$CONFDIR: cannot open, stopped";
+sub subcmd_build_patterns () {
+	opendir my $d, $PATTERNSDIR or do {
+		die "$PATTERNSDIR: cannot open, stopped";
 	};
 	my %mtime;
 	my %option;
 	while( my $e = readdir $d ){
 		next if $e =~ m"^\.";
 		if    ( $e =~ m"^([-\w]+)\.pattern$" ){
-			my $mtime = get_mtime "$CONFDIR/$e";
+			my $mtime = get_mtime "$PATTERNSDIR/$e";
 			next unless $mtime > 0;
 			$mtime{$1}->{pattern} = $mtime;
 		}elsif( $e =~ m"^([-\w]+)\.rules$" ){
-			my $mtime = get_mtime "$CONFDIR/$e";
+			my $mtime = get_mtime "$PATTERNSDIR/$e";
 			next unless $mtime > 0;
 			$mtime{$1}->{src} = $mtime if
 				not defined($mtime{$1}->{src}) or
 				$mtime > $mtime{$1}->{src};
 		}elsif( $e =~ m"^([-\w]+)(?:\+([-\w]+))?\.sample$" ){
-			my $mtime = get_mtime "$CONFDIR/$e";
+			my $mtime = get_mtime "$PATTERNSDIR/$e";
 			next unless $mtime > 0;
 			$mtime{$1}->{src} = $mtime if
 				not defined($mtime{$1}->{src}) or
@@ -391,17 +406,17 @@ sub action_build_pattern () {
 	close $d;
 
 	while( my ($k, $v) = each %mtime ){
-		print "$CONFDIR/$k.sample: not found.\n" unless
-			-f "$CONFDIR/$k.sample";
-		print "$CONFDIR/$k.rules: not found.\n" unless
-			-f "$CONFDIR/$k.rules";
-		next unless -f "$CONFDIR/$k.sample" and -f "$CONFDIR/$k.rules";
-		next if -f "$CONFDIR/$k.pattern" and $v->{src} < $v->{pattern};
+		print "$PATTERNSDIR/$k.sample: not found.\n" unless
+			-f "$PATTERNSDIR/$k.sample";
+		print "$PATTERNSDIR/$k.rules: not found.\n" unless
+			-f "$PATTERNSDIR/$k.rules";
+		next unless -f "$PATTERNSDIR/$k.sample" and -f "$PATTERNSDIR/$k.rules";
+		next if -f "$PATTERNSDIR/$k.pattern" and $v->{src} < $v->{pattern};
 		my $command = "$BINDIR/panopticfilter build";
-		$command .= " -r $CONFDIR/$k.rules -d $CONFDIR/$k.diagnosis";
-		$command .= " -o $CONFDIR/$k.pattern -f $CONFDIR/$k.sample";
+		$command .= " -r $PATTERNSDIR/$k.rules -d $PATTERNSDIR/$k.diagnosis";
+		$command .= " -o $PATTERNSDIR/$k.pattern -f $PATTERNSDIR/$k.sample";
 		foreach my $i ( @{$option{$k} // []} ){
-			$command .= " -e $i -f $CONFDIR/$k+$i.sample";
+			$command .= " -e $i -f $PATTERNSDIR/$k+$i.sample";
 		}
 		system "$command\n";
 	}
@@ -410,37 +425,31 @@ sub action_build_pattern () {
 }
 
 ####
-my $conf = read_conf;
-if    ($ARGV[0] eq 'build_conf'){
-	action_build_fluentdconf $conf;
-}elsif($ARGV[0] eq 'build_pattern'){
-	action_build_pattern;
-}elsif($ARGV[0] eq 'show_anomalylog'){
-	action_show_anomalylog $conf;
-}elsif($ARGV[0] eq 'cover_pattern'){
-	action_cover_pattern $conf;
-
-
+my $conf = read_fluentd_conf;
+if    ($ARGV[0] eq 'build_fluentd_conf'){
+	subcmd_build_fluentd_conf $conf;
+}elsif($ARGV[0] eq 'build_patterns'){
+	subcmd_build_patterns;
 }elsif($ARGV[0] eq 'capture_anomalylog'){
-	action_capture_anomalylog $conf;
+	subcmd_capture_anomalylog $conf;
 }elsif($ARGV[0] eq 'capture_unmonitoredlog'){
-	action_capture_unmonitoredlog $conf;
+	subcmd_capture_unmonitoredlog $conf;
 }elsif($ARGV[0] eq 'show_capturedlog'){
-	action_show_capturedlog $conf;
+	subcmd_show_capturedlog $conf;
 }elsif($ARGV[0] eq 'strip_capturedlog'){
-	action_strip_capturedlog $conf;
+	subcmd_strip_capturedlog $conf;
 }elsif($ARGV[0] eq 'import_capturedlog'){
-	action_import_capturedlog $conf;
+	subcmd_import_capturedlog $conf;
 }elsif($ARGV[0] eq 'list_unmonitoredlog'){
-	action_list_unmonitoredlog $conf;
+	subcmd_list_unmonitoredlog $conf;
 }elsif($ARGV[0] eq 'strip_sample'){
-	action_strip_sample $conf;
+	subcmd_strip_sample $conf;
 }else{
 	print	"usage: % $0 <SUBCOMMAND>\n",
 		"\n",
 		"    SUBCOMMAND\n",
-		"         build_conf\n",
-		"         build_pattern\n",
+		"         build_fluentd_conf\n",
+		"         build_patterns\n",
 		"         capture_anomalylog\n",
 		"         capture_unmonitoredlog\n",
 		"         show_capturedlog\n",
