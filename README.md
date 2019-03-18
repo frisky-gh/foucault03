@@ -10,7 +10,7 @@ Foucault03 is a anomaly log monitoring system.
 
 ## Description
 
-Foucault03 monitors logs treated by fluentd tagged "multiline.**".
+Foucault03 system monitors logs treated by fluentd and tagged "multilinelog.**".
 The system detects anomaly logs defined by pre-generated patterns.
 Patterns are builded from sample logs and build rules.
 If you hope to monitor /var/log/messages, you may use /var/log/messages
@@ -19,8 +19,6 @@ for a sample log as is.
 Build rules may specify variable words in the logs by regexp, like following:
 * `\d+\.\d+\.\d+\.\d+` (IP address)
 * `(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\x20[\x200-9][0-9]\x20[\x200-9][0-9]:[0-9][0-9]:[0-9][0-9]` (timestamp)
-
-Sample logs are 
 
 ## Instllation
 
@@ -71,6 +69,24 @@ SUBCOMMAND is one of following:
 <dd>  Template file for a flash report of anomaly log by mail.
 <dt> conf/deliver_daily.tt
 <dd>  
+<dt> conf/fluentd/fluentd_foucault03.conf
+<dd>  fluentd configuration file. It's included by /etc/td-agent/td-agent.conf.
+<dt> conf/patterns/*.rules
+<dd>  Build rules file. You may customize it to adjust to your VMs.
+<dt> conf/patterns/*.sample
+<dd>  Sample log file. You may put log file you want to target. Its size is hoped to be less than < 1MB.
+<dt> conf/patterns/*.pattern
+<dd>  Pattern file. It's builded from a sample log and build rules, by `foucaultctl build_patterns`.
+<dt> anomalylog/*
+<dd>  File of anomaly logs detected by foucault03.
+<dt> unmonitoredlog/*
+<dd>  File of logs that is not monitored.
+<dt> capturedlog/*
+<dd>  File of logs that is caputured from anomalylog or unmonitoredlog by 'capture_anomalylog' or 'capture_unmonitoredlog' subcommand.
+<dt> deliveredevent/*
+<dd>  File of events that is delivered to recipients.
+<dt> undeliveredevent/*
+<dd>  File of events file that is not delivered to any recipients.
 </dl>
 
 ## Licence
