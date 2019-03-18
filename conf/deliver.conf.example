@@ -3,7 +3,7 @@ category mppf_flash
 	tagmatch	syslog\..*
 	eventmatch	ANOMALY
 	type		flash
-	reciever	frisky-gh@example.com
+	receiver	frisky-gh@example.com
 	mininterval	60
 
 
