@@ -37,7 +37,7 @@ sub read_deliver_conf () {
 			    tagmatch	\s+ (?<tagmatch>    \S.*) |
 			    eventmatch	\s+ (?<eventmatch>  \S.*) |
 			    type	\s+ (?<type>        \S.*) |
-			    reciever	\s+ (?<reciever>    \S.*) |
+			    receiver	\s+ (?<receiver>    \S.*) |
 			recipient	\s+ (?<recipient>   \S.*) |
 			    maxsize     \s+ (?<maxsize>     \S.*) |
 			    mininterval	\s+ (?<mininterval> \S.*) |
@@ -53,7 +53,7 @@ sub read_deliver_conf () {
 				type        => undef,
 				tagregexp   => qr".*",
 				eventregexp => qr".*",
-				recievers   => [],
+				receivers   => [],
 				maxsize     => 1000,
 				mininterval => 30,
 			};
@@ -69,8 +69,8 @@ sub read_deliver_conf () {
 			$directive->{eventregexp} = qr"$+{eventmatch}";
 		}elsif( $+{type} ){
 			$directive->{type} = $+{type};
-		}elsif( $+{reciever} ){
-			push @{$directive->{recievers}}, $+{reciever};
+		}elsif( $+{receiver} ){
+			push @{$directive->{receivers}}, $+{receiver};
 		}elsif( $+{maxsize} ){
 			$directive->{maxsize} = $+{maxsize};
 		}elsif( $+{mininterval} ){
@@ -348,7 +348,7 @@ sub subcmd_prepare ($) {
 				my $tag = $obj->{tag};
 				my $event = $obj->{event};
 				my $message = $obj->{message};
-				$tag =~ s{^anomalylog\.}{};
+				$tag =~ s{^foucault03log\.}{};
 				$tag =~ s{\.\d{4}-\d{2}-\d{2}_\d{2}:\d{2}(\.\d+)?$}{};
 
 				my $delivery_is_planned;
@@ -421,8 +421,8 @@ sub subcmd_deliverflash ($) {
 
 		my $snippet = generate_snippet \%tag2event2messages;
 
-		my $recievers = $category->{recievers};
-		foreach my $reciever ( @$recievers ){
+		my $receivers = $category->{receivers};
+		foreach my $receiver ( @$receivers ){
 			my $output;
 			my $tt = Template->new({
 				INCLUDE_PATH => $CONFDIR,
@@ -430,14 +430,14 @@ sub subcmd_deliverflash ($) {
 			});
 			my $var = {
 				MAILFROM => $mailfrom,
-				MAILTO   => $reciever,
+				MAILTO   => $receiver,
 				SNIPPET  => $snippet,
 			};
 			$tt->process( 'deliver_flash.tt', $var, \$output ) or do {
 				die $tt->error(), ", stopped";
 			};
-			sendmail $output, $mailfrom, $reciever;
-			#print $output, $MAILFROM, $reciever, "\n";
+			sendmail $output, $mailfrom, $receiver;
+			#print $output, $MAILFROM, $receiver, "\n";
 		}
 
 		store_lastsend $name, $now;

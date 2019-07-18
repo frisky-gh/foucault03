@@ -4,7 +4,7 @@ use strict;
 use Time::Local;
 use Regexp::Assemble;
 use Getopt::Long qw(:config posix_default no_ignore_case gnu_compat);
-use JSON;
+use JSON::XS;
 use Encode;
 
 our $DEBUG;
@@ -167,6 +167,12 @@ sub read_rulefile ($) {
 	close $h;
 	my $re = "(" . join("|", @res) . ")";
 
+	eval { qr"$re"; };
+	if( $@ ){
+		print STDERR "$conffile:$.: $re\n";
+		die "$conffile:$.: cannot compile, stopped";
+		next;
+	}
 	return qr"$re", %mark2replace;
 }
 
@@ -286,12 +292,18 @@ sub cmd_build ($$$\%) {
 	exit 0;
 }
 
-sub cmd_strip ($$) {
-	my ($rulefile, $patternfile) = @_;
+sub cmd_strip ($$$) {
+	my ($rulefile, $patternfile, $diagnosisfile) = @_;
 	$| = 1;
 	my ($rule_re, %mark2replace) = read_rulefile $rulefile;
 	$PATTERNFILE = $patternfile;
 	my $re = read_patternfile if defined $patternfile;
+	my $diagnosisfh;
+	if( defined $diagnosisfile ){
+		open $diagnosisfh, '>', $diagnosisfile or do {
+			die "$diagnosisfile: cannot open, stopped";
+		};
+	}
 	my %redundant;
 	while(<STDIN>){
 		chomp;
@@ -309,6 +321,7 @@ sub cmd_strip ($$) {
 
 		$redundant{$pattern_fracture} = 1;
 		print "$_\n";
+		print $diagnosisfh "$pattern_fracture\n" if $diagnosisfh;
 	}
 	exit 0;
 }
@@ -337,7 +350,7 @@ sub cmd_filter ($$$$$@) {
 	$| = 1;
 	$PATTERNFILE = $patternfile;
 	my $re = read_patternfile;
-	my $codec = JSON->new;
+	my $codec = JSON::XS->new;
 	$MUST_REOPEN = 1;
 	set_patternfile_checker;
 	while( <STDIN> ){
@@ -384,7 +397,7 @@ sub cmd_ltsv2text ($) {
 sub cmd_json2text ($) {
 	my ($fieldname) = @_;
 	$| = 1;
-	my $decoder = JSON->new;
+	my $decoder = JSON::XS->new;
 	while( <STDIN> ){
 		chomp;
 		eval {
@@ -400,7 +413,7 @@ sub cmd_json2text ($) {
 sub cmd_text2json ($) {
 	my ($fieldname) = @_;
 	$| = 1;
-	my $encoder = JSON->new;
+	my $encoder = JSON::XS->new;
 	while( <STDIN> ){
 		chomp;
 		my $message = $encoder->encode( { $fieldname => $_ } );
@@ -440,6 +453,101 @@ sub cmd_multiline2singleline ($) {
 	exit 0;
 }
 
+sub commontext ($$) {
+	my ($left, $right) = @_;
+	my $common;
+	my $leftlen = length $left;
+	my $rightlen = length $right;
+	my $commonlen = $leftlen < $rightlen ? $leftlen : $rightlen;
+	for( my $i = 0; $i < $commonlen; $i++ ){
+		return $common, substr($left, $i), substr($right, $i)
+			if substr($left, $i, 1) ne substr($right, $i, 1);
+		$common .= substr($left, $i, 1);
+	}
+	my $i = length $common;
+	return $common, substr($left, $i), substr($right, $i)
+}
+
+sub cmd_whydonthit ($$) {
+	my ($rulefile, $samplefile) = @_;
+	my ($rule_re, %mark2replace) = read_rulefile $rulefile;
+	my %patterns;
+	my @pattern_infos;
+	my @res;
+	debuglog "generate_pattern: samplefile=%s.", $samplefile;
+
+	open my $h, '<', $samplefile or die "$samplefile: cannot open, stopped";
+	while( <$h> ){
+		chomp;
+		next if m"^\s*(#|$)";
+		my $pattern_fracture = generalize $rule_re, %mark2replace, $_;
+		next if $patterns{$pattern_fracture};
+
+		eval { qr"$pattern_fracture"; };
+		if( $@ ){
+			print STDERR "$samplefile:$.: $pattern_fracture\n";
+			die "$samplefile:$.: cannot compile, stopped";
+		}
+
+		$patterns{$pattern_fracture} = 1;
+		my $pattern_info = {
+			re => $pattern_fracture,
+			pos => "$samplefile:$.",
+			src => $_,
+		};
+		push @pattern_infos, $pattern_info;
+	}
+	close $h;
+
+	my $codec = JSON::XS->new;
+
+	OUTSIDE:
+	while(<STDIN>){
+		chomp;
+		my $pattern_fracture = generalize $rule_re, %mark2replace, $_;
+		eval { qr"$pattern_fracture"; };
+		if( $@ ){
+			print STDERR "STDIN:$.: $pattern_fracture\n";
+			die "STDIN:$.: cannot compile, stopped";
+		}
+
+		my $common;
+		my $unmatch;
+		foreach my $pattern_info ( @pattern_infos ){
+			my $re = $pattern_info->{re};
+			if( m"^$re$" ){
+				my $match = {
+					text    => $_,
+					pos     => "STDIN:$.",
+					status  => "match",
+					match_pattern => $pattern_info,
+				};
+				my $json = $codec->encode( $match );
+				print "$json\n";
+				next OUTSIDE;
+			}
+			my ($c, $l, $r) = commontext $re, $pattern_fracture;
+			next if length($common) > length($c);
+			$common = $c;
+			$unmatch = {
+				text   => $_,
+				pos    => "STDIN:$.",
+				status => "unmatch",
+				re     => $pattern_fracture,
+				pattern_difference => {
+					common => $common,
+					old => $l,
+					new => $r,
+				},
+				candidate_pattern => $pattern_info,
+			};
+		}
+		
+		my $json = $codec->encode( $unmatch );
+		print "$json\n";
+	}
+	exit 0;
+}
 
 ####
 my $cmd = shift @ARGV;
@@ -549,18 +657,31 @@ CODE
 	my $firstline_regexp = qr"$firstline";
 	cmd_multiline2singleline($firstline_regexp);
 
-}elsif( $cmd eq 'whyhit' ){
+}elsif( $cmd eq 'whydonthit' ){
+	my $rulefile;
+	my $samplefile;
+	GetOptions (
+		'rulefile|r=s'      => \$rulefile,
+		'samplefile|f=s'    => \$samplefile,
+	) or die "Invalid command line options, stopped";
+	die unless defined $rulefile;
+	die unless defined $samplefile;
+	cmd_whydonthit $rulefile, $samplefile;
+
 }elsif( $cmd eq 'strip' ){
 	my $rulefile;
 	my $patternfile;
+	my $diagnosisfile;
 	GetOptions (
 		'rulefile|r=s'   => \$rulefile,
 		'petternfile|p=s' => \$patternfile,
+		'diagnosisfile|d=s' => \$diagnosisfile,
 	) or die "Invalid command line options, stopped";
 	die unless defined $rulefile;
-	cmd_strip($rulefile, $patternfile);
+	cmd_strip($rulefile, $patternfile, $diagnosisfile);
+
 }elsif( $cmd eq 'version' ){
-	print "0.0.1\n";
+	print "0.0.2\n";
 	exit 0;
 }else{
 	die;

@@ -20,7 +20,7 @@ Build rules may specify variable words in the logs by regexp, like following:
 * `\d+\.\d+\.\d+\.\d+` (IP address)
 * `(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\x20[\x200-9][0-9]\x20[\x200-9][0-9]:[0-9][0-9]:[0-9][0-9]` (timestamp)
 
-## Instllation
+## Installation
 
 1. `git clone https://github.com/frisky-gh/foucault03.git`
 2. `cd foucault03`

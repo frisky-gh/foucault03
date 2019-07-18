@@ -19,6 +19,91 @@ our $MULTILINE2SINGLELINEDIR = "$TOOLHOME/multiline2singleline";
 our $PATTERNSDIR             = "$TOOLHOME/conf/patterns";
 our $FLUENTDCONFDIR          = "$TOOLHOME/conf/fluentd";
 
+####
+sub get_logstatus ($$) {
+	my ($dir, $regexp) = @_;
+	my $status = {};
+	opendir my $d, $dir or do {
+		die "$dir: cannot open, stoped";
+	};
+	while( my $e = readdir $d ){
+		next if $e =~ m"^\.";
+		next unless $e =~ m"^$regexp$";
+		next unless -f "$dir/$e";
+		my ($dev, $inode, $mode, $nlink, $uid, $gid, $rdev, $size) =
+			stat "$dir/$e";
+		$status->{$e} = {"size" => $size};
+	}
+	close $d;
+	return $status;
+}
+
+sub load_logstatus ($) {
+	my ($statusname) = @_;
+	my $f = "$STATUSDIR/logstatus.$statusname";
+	open my $h, '<', $f or return {};
+	my $status = {};
+	while( <$h> ){
+		chomp;
+		my ($file, $size) = split m"\t";
+		$status->{$file} = {size => $size};
+	}
+	close $h;
+	return $status;
+}
+
+sub store_logstatus ($$) {
+	my ($statusname, $status) = @_;
+	my $f = "$STATUSDIR/logstatus.$statusname";
+	my $g = "$STATUSDIR/.logstatus.$statusname";
+	open my $h, '>', $g or do {
+		die "$g: cannot open, stoped";
+	};
+	foreach my $file ( sort {$a cmp $b} keys %$status ){
+		my $values = $status->{$file};
+		print $h join("\t", $file, $values->{size}), "\n";
+	}
+	close $h;
+
+	unlink $f if -f $f;
+	rename $g, $f or do {
+		die "$f: cannot open, stoped";
+	}
+}
+
+sub read_partial ($$$) {
+	my ($file, $offset, $length)= @_;
+	my $buff;
+	open my $h, '<', $file or do {
+		die "$file: cannot open, stopped";
+	};
+	seek $h, $offset, 0;
+	read $h, $buff, $length;
+	close $h;
+	return $buff;
+}
+
+sub read_incremental ($$$&) {
+	my ($dir, $statusname, $regexp, $handler) = @_;
+	my $laststatus = load_logstatus $statusname;
+	my $currstatus = get_logstatus $dir, $regexp;
+	
+	while( my ($file, $currvalues) = each %$currstatus ){
+		my $lastvalues = $laststatus->{$file} || {'size' => 0};
+		my $currsize = $currvalues->{"size"};
+		my $lastsize = $lastvalues->{"size"};
+		next if $currsize == $lastsize;
+		$lastsize = 0 if $currsize < $lastsize;
+		my $offset = $lastsize;
+		my $length = $currsize - $lastsize;
+		my $partial = read_partial "$dir/$file", $offset, $length;
+		&$handler( $file, $partial );
+	}
+
+	store_logstatus $statusname, $currstatus;
+}
+
+####
 sub remove_wildcard ($) {
 	my @fields;
 	foreach my $field ( split m"\.", $_[0] ){
@@ -162,80 +247,93 @@ sub subcmd_build_fluentd_conf ($) {
 sub subcmd_capture_anomalylog ($) {
 	my ($conf) = @_;
 	
-	opendir my $d, $ANOMALYLOGDIR or do {
-		die "$ANOMALYLOGDIR: cannot open. stopped";
-	};
-	my @anomalylog;
-	while( my $e = readdir $d ){
-		next if $e =~ m"^\.";
-		next unless $e =~ m"^anomalylog\.(.*)$";
-		push @anomalylog, $1; 
-	}
-	close $d;
+	read_incremental
+		$ANOMALYLOGDIR,
+		"capture_anomalylog",
+		qr"^anomalylog\..*$",
+		sub {
+			my ($anomalylogfile, $diff) = @_;
+			my ($basename) = $anomalylogfile =~ m"^anomalylog\.(.*)";
+			my $matched;
+			foreach my $m ( @{ $conf->{anomalymonitor} } ){
+				my $regexp = $m->{outputlogregexp};
+				my $fixed = $m->{tagfixed};
+				my $pattern = $m->{pattern};
+				next unless $basename =~ $regexp;
+				next unless defined $pattern;
 
-	foreach my $anomalylog ( @anomalylog ){
-		my $matched;
-		foreach my $m ( @{ $conf->{anomalymonitor} } ){
-			my $regexp = $m->{outputlogregexp};
-			my $fixed = $m->{tagfixed};
-			my $pattern = $m->{pattern};
-			next unless $anomalylog =~ $regexp;
-			next unless defined $pattern;
-			my $cmd;
-			$cmd .= "cat $ANOMALYLOGDIR/anomalylog.$anomalylog |";
-			$cmd .= " $BINDIR/panopticfilter filter -p $PATTERNSDIR/$pattern.pattern -e 's///' |";
-			$cmd .= " grep ANOMALY |";
-			$cmd .= " $BINDIR/panopticfilter json2text |";
-			$cmd .= " $BINDIR/panopticfilter strip -r $PATTERNSDIR/$pattern.rules";
-			$cmd .= " -p $PATTERNSDIR/$pattern.pattern" if -f "$PATTERNSDIR/$pattern.pattern";
-			$cmd .= " >> $CAPTUREDLOGDIR/capturedlog.$pattern";
-			system $cmd;
-			$matched = 1;
-			last;
-		}
-		print "$anomalylog: not matched.\n" unless $matched;
-	}
+				my $outputfile = "$CAPTUREDLOGDIR/capturedlog.$pattern";
+				my $patternfile = "$PATTERNSDIR/$pattern.pattern";
+				my $rulefile = "$PATTERNSDIR/$pattern.rules";
+
+				my $cmd;
+				$cmd .= "$BINDIR/panopticfilter filter -p $patternfile -e 's///' |";
+				$cmd .= " grep ANOMALY |";
+				$cmd .= " $BINDIR/panopticfilter json2text |";
+				$cmd .= " $BINDIR/panopticfilter strip -r $rulefile";
+				$cmd .= " -p $patternfile" if -f $patternfile;
+				$cmd .= " >> $outputfile";
+				open my $h, "|-", $cmd or do {
+					die;
+				};
+				print $h $diff;
+				close $h;
+				unlink $outputfile unless -s $outputfile;
+				$matched = 1;
+				last;
+			}
+			print "$anomalylogfile: not matched.\n" unless $matched;
+		};
+
 	exit 0;
 }
 
 sub subcmd_capture_unmonitoredlog ($) {
 	my ($conf) = @_;
 
-	opendir my $d, $UNMONITOREDLOGDIR or do {
-		die "$UNMONITOREDLOGDIR: cannot open. stopped";
-	};
-	my @unmonitoredlog;
-	while( my $e = readdir $d ){
-		next if $e =~ m"^\.";
-		next unless $e =~ m"^unmonitoredlog\.(.*)$";
-		push @unmonitoredlog, $1; 
-	}
-	close $d;
-
+	my $cmd;
 	foreach my $m ( @{ $conf->{anomalymonitor} } ){
 		my $pattern = $m->{pattern};
 		next unless defined $pattern;
 		next if -f "$PATTERNSDIR/$pattern.pattern";
 
-		my $cmd;
-		unless( -f "$PATTERNSDIR/$pattern.rules" ){
-			$cmd .= "cp $CONFDIR/rules.template $PATTERNSDIR/$pattern.rules ; ";
-		}
-		unless( -f "$PATTERNSDIR/$pattern.sample" ){
-			my $regexp = $m->{inputlogregexp};
-			my @logs;
-			foreach my $unmonitoredlog ( @unmonitoredlog ){
-				next unless $unmonitoredlog =~ $regexp;
-				push @logs, "$UNMONITOREDLOGDIR/unmonitoredlog.$unmonitoredlog";
-			}
-			if( @logs ){
-				$cmd .= "cat @logs |";
-				$cmd .= " $BINDIR/panopticfilter strip -r $PATTERNSDIR/$pattern.rules";
-				$cmd .= " >> $CAPTUREDLOGDIR/capturedlog.$pattern";
-			}
-		}
-		system $cmd if $cmd;
+		$cmd .= "cp $CONFDIR/rules.template $PATTERNSDIR/$pattern.rules ; "
+			unless -f "$PATTERNSDIR/$pattern.rules";
 	}
+	system $cmd if $cmd;
+
+	read_incremental
+		$UNMONITOREDLOGDIR,
+		"capture_unmonitoredlog",
+		qr"^unmonitoredlog\..*$",
+		sub {
+			my ($unmonitoredlogfile, $diff) = @_;
+			my ($basename) = $unmonitoredlogfile =~ m"^unmonitoredlog\.(.*)";
+			foreach my $m ( @{ $conf->{anomalymonitor} } ){
+				#my $regexp = $m->{outputlogregexp};
+				my $regexp = $m->{inputlogregexp};
+				my $fixed = $m->{tagfixed};
+				my $pattern = $m->{pattern};
+				next unless $basename =~ $regexp;
+				next unless defined $pattern;
+
+				my $outputfile = "$CAPTUREDLOGDIR/capturedlog.$pattern";
+				my $patternfile = "$PATTERNSDIR/$pattern.pattern";
+				my $rulefile = "$PATTERNSDIR/$pattern.rules";
+
+				my $cmd;
+				$cmd .= "$BINDIR/panopticfilter strip -r $rulefile";
+				$cmd .= " -p $patternfile" if -f $patternfile;
+				$cmd .= " >> $outputfile";
+				open my $h, "|-", $cmd or do {
+					die;
+				};
+				print $h $diff;
+				close $h;
+				unlink $outputfile unless -s $outputfile;
+				last;
+			}
+		};
 	exit 0;
 }
 
@@ -336,6 +434,32 @@ sub subcmd_strip_capturedlog ($) {
 		$cmd .= " > $CAPTUREDLOGDIR/stripedlog.$pattern ; ";
 		$cmd .= "mv $CAPTUREDLOGDIR/stripedlog.$pattern";
 		$cmd .= " $CAPTUREDLOGDIR/capturedlog.$pattern";
+		system $cmd;
+		unlink "$CAPTUREDLOGDIR/capturedlog.$pattern" unless -s "$CAPTUREDLOGDIR/capturedlog.$pattern";
+	}
+	exit 0;
+}
+
+sub subcmd_whydonthit_capturedlog ($) {
+	my ($conf) = @_;
+	opendir my $d, $CAPTUREDLOGDIR or do {
+		die "$CAPTUREDLOGDIR: cannot open. stopped";
+	};
+	my @capturedlog;
+	while( my $e = readdir $d ){
+		next if $e =~ m"^\.";
+		next unless $e =~ m"^capturedlog\.(.*)$";
+		push @capturedlog, $1;
+	}
+	close $d;
+	foreach my $pattern ( sort @capturedlog ){
+		next unless -s "$CAPTUREDLOGDIR/capturedlog.$pattern";
+		my $cmd;
+		$cmd .= "$BINDIR/panopticfilter whydonthit";
+		$cmd .= " -r $PATTERNSDIR/$pattern.rules";
+		$cmd .= " -f $PATTERNSDIR/$pattern.sample";
+		$cmd .= " < $CAPTUREDLOGDIR/capturedlog.$pattern |";
+		$cmd .= "jq .";
 		system $cmd;
 	}
 	exit 0;
@@ -438,6 +562,8 @@ if    ($ARGV[0] eq 'build_fluentd_conf'){
 	subcmd_show_capturedlog $conf;
 }elsif($ARGV[0] eq 'strip_capturedlog'){
 	subcmd_strip_capturedlog $conf;
+}elsif($ARGV[0] eq 'whydonthit_capturedlog'){
+	subcmd_whydonthit_capturedlog $conf;
 }elsif($ARGV[0] eq 'import_capturedlog'){
 	subcmd_import_capturedlog $conf;
 }elsif($ARGV[0] eq 'list_unmonitoredlog'){
@@ -460,4 +586,11 @@ if    ($ARGV[0] eq 'build_fluentd_conf'){
 		"\n";
 	exit 1;
 }
+
+
+####
+
+exit 0;
+
+ 
 
