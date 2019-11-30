@@ -29,13 +29,26 @@
       cron:
         user: td-agent
         name: "foucault03 prepare batch"
-        minute: "*/10"
+        minute: "00-55/5"
         job: "{{TOOLHOME}}/bin/foucaultcron prepare"
 
     - name: "foucault03 crontab setup"
       cron:
         user: td-agent
-        name: "foucault03 deliverflash batch"
-        minute: "*/10"
-        job: "{{TOOLHOME}}/bin/foucaultcron deliverflash"
+        name: "foucault03 deliver_flash batch"
+        minute: "01-56/5"
+        job: "{{TOOLHOME}}/bin/foucaultcron deliver_flash"
 
+    - name: "foucault03 crontab setup"
+      cron:
+        user: td-agent
+        name: "foucault03 deliver_daily batch"
+        hour: "09"
+        minute: "05"
+        job: "{{TOOLHOME}}/bin/foucaultcron deliver_daily"
+
+    - name: install gems fluent-plugin-concat
+      gem:
+        executable:   /opt/td-agent/embedded/bin/gem
+        name:         fluent-plugin-concat
+        user_install: false

@@ -274,7 +274,7 @@ sub subcmd_capture_anomalylog ($) {
 				$cmd .= " -p $patternfile" if -f $patternfile;
 				$cmd .= " >> $outputfile";
 				open my $h, "|-", $cmd or do {
-					die;
+					die "command \"$cmd\", stopped";
 				};
 				print $h $diff;
 				close $h;

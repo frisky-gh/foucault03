@@ -283,6 +283,41 @@ sub generate_snippet ($) {
 	return $summary;
 }
 
+sub generate_summary ($) {
+	my ($tag2event2messages) = @_;
+
+	my $text;
+	my @summary;
+	my %event2tag2messages;
+	my %event2messages;
+	foreach my $tag ( sort keys %$tag2event2messages ){
+		my $event2messages = $tag2event2messages->{$tag};
+		foreach my $event ( sort keys %$event2messages ){
+			my $messages = @{$event2messages->{$event}};
+
+			$event2tag2messages{$event}->{$tag} = $messages;
+			$event2messages{$event} += $messages;
+		}
+	}
+	foreach my $event (
+		sort {$event2messages{$b} <=> $event2messages{$a}}
+		keys %event2messages
+	){
+		my $tag2messages = $event2tag2messages{$event};
+		my @eventsummary;
+		foreach my $tag (
+			sort {$$tag2messages{$b} <=> $$tag2messages{$a}}
+			keys %$tag2messages
+		){
+			my $messages = $$tag2messages{$tag};
+			$text .= sprintf "%-10s has been found %3d cases at %s.\n", $event, $messages, $tag;
+			push @eventsummary, {tag=>$tag, messages=>$messages};
+		}
+		push @summary, {event=>$event, summary=>[@eventsummary]};
+	}
+	return ($text, \@summary);
+}
+
 ####
 sub sendmail ($$$) {
 	my ($mail, $mailfrom, $mailto) = @_;
@@ -324,7 +359,7 @@ sub subcmd_cleanup ($) {
 	remove_old
 		$ANOMALYLOGDIR, 
 		qr"^anomalylog\..*$",
-		36 * 60 * 60;
+		7 * 24 * 60 * 60;
 }
 
 sub subcmd_prepare ($) {
@@ -376,7 +411,7 @@ sub subcmd_prepare ($) {
 	exit 0;
 }
 
-sub subcmd_deliverflash ($) {
+sub subcmd_deliver_flash ($) {
 	my ($conf) = @_;
 	my $categories = $conf->{categories};
 	my $recipients = $conf->{recipients};
@@ -445,7 +480,67 @@ sub subcmd_deliverflash ($) {
 	exit 0;
 }
 
-sub subcmd_deliverdaily ($) {
+sub subcmd_deliver_daily ($) {
+	my ($conf) = @_;
+	my $categories = $conf->{categories};
+	my $recipients = $conf->{recipients};
+	my $mailfrom = $conf->{param}->{MAILFROM} // "foucault03\@example.com";
+
+	my $now = time;
+	foreach my $category ( @$categories ){
+		my $type = $category->{type};
+		next unless $type eq 'daily';
+
+		my $name = $category->{name};
+		my $tagregexp = $category->{tagregexp};
+		my $eventregexp = $category->{eventregexp};
+		my $message_exists;
+		my %tag2event2messages;
+		read_incremental
+			$DELIVEREDEVENTDIR,
+			"deliverdaily.$name",
+			qr"^deliveredevent\.\d{4}-\d{2}-\d{2}\.$tagregexp\+$eventregexp$",
+			sub {
+				my ($file, $diff) = @_;
+				$file =~ m"^deliveredevent\.(\d{4}-\d{2}-\d{2})\.([^+]+)\+(.*)$" or die;
+				my $date = $1;
+				my $tag = $2;
+				my $event = $3;
+				my @messages;
+				foreach my $message ( split m"\n+", $diff ){
+					next if $message eq '';
+					push @messages, $message;
+				}
+				return unless @messages;
+				push @{$tag2event2messages{$tag}->{$event}}, @messages;
+				$message_exists = 1;
+			};
+
+		next unless $message_exists;
+
+		my ($text, $summary) = generate_summary \%tag2event2messages;
+
+		my $receivers = $category->{receivers};
+		foreach my $receiver ( @$receivers ){
+			my $output;
+			my $tt = Template->new({
+				INCLUDE_PATH => $CONFDIR,
+				OUTPUT_PATH => $CONFDIR
+			});
+			my $var = {
+				MAILFROM => $mailfrom,
+				MAILTO   => $receiver,
+				TEXT  => $text,
+				SUMMARY  => $summary,
+			};
+			$tt->process( 'deliver_daily.tt', $var, \$output ) or do {
+				die $tt->error(), ", stopped";
+			};
+			sendmail $output, $mailfrom, $receiver;
+			#print $output, $mailfrom, $receiver, "\n";
+		}
+		store_lastsend $name, $now;
+	}
 	exit 0;
 }
 
@@ -454,12 +549,19 @@ if    ( $ARGV[0] eq 'cleanup' ){
 	subcmd_cleanup $conf;
 }elsif( $ARGV[0] eq 'prepare' ){
 	subcmd_prepare $conf;
-}elsif( $ARGV[0] eq 'deliverflash' ){
-	subcmd_deliverflash $conf;
-}elsif( $ARGV[0] eq 'deliverdaily' ){
-	subcmd_deliverdaily $conf;
+}elsif( $ARGV[0] eq 'deliver_flash' ){
+	subcmd_deliver_flash $conf;
+}elsif( $ARGV[0] eq 'deliver_daily' ){
+	subcmd_deliver_daily $conf;
 }else{
-	print "usage: % $0 prepare\n";
+	print	"usage: % $0 ACTION\n",
+		"\n",
+		"    ACTION\n",
+		"	cleanup\n",
+		"	prepare\n",
+		"	deliver_flash\n",
+		"	deliver_daily\n",
+		"\n";
 	exit 0;
 }
 

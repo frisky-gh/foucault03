@@ -1,0 +1,12 @@
+From: "Foucault03 monitoring system" <foucault03@example.com>
+To: "You" <[%MAILTO%]>
+Subject: [REPORT] foucault03 found anomaly logs.
+
+[% FOREACH i IN SUMMARY -%]
+*** [% i.event %] has found
+[%     FOREACH j IN i.summary -%]
+[% j.messages FILTER format('%3d') %] cases at [% j.tag %]
+[%     END -%]
+
+[% END -%]
+
