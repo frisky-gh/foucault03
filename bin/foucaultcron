@@ -1,84 +1,151 @@
 #!/usr/bin/perl
 
 use strict;
+use Sys::Hostname;
 use Cwd "abs_path";
+use String::Random 'random_regex';
 use JSON;
+use Time::Local;
 use Template;
 use Encode;
 use MIME::EncWords ':all';
+use MIME::QuotedPrint;
 
 $0 =~ m"^(.*)/";
 our $TOOLHOME = abs_path( "$1/.." // '.' );
-our $CONFDIR             = "$TOOLHOME/conf";
-our $SPOOLDIR            = "$TOOLHOME/spool";
-our $STATUSDIR           = "$TOOLHOME/status";
-our $ANOMALYLOGDIR       = "$TOOLHOME/anomalylog";
-our $DELIVEREDEVENTDIR   = "$TOOLHOME/deliveredevent";
-our $UNDELIVEREDEVENTDIR = "$TOOLHOME/undeliveredevent";
+our $BINDIR	       = "$TOOLHOME/bin";
+our $CONFDIR	       = "$TOOLHOME/conf";
+our $WELLKNOWNSDIR     = "$TOOLHOME/conf/wellknowns";
+our $STATUSDIR	       = "$TOOLHOME/status";
+
+our $LOGDIR            = "$TOOLHOME/log";
+our $DETECTDIR         = "$TOOLHOME/detect";
+our $ALERTDIR	       = "$TOOLHOME/alert";
+our $WEEKLYSTATSDIR    = "$TOOLHOME/weeklystats";
+our $WWWDIR	       = "$TOOLHOME/www";
 
 our $SENDMAILEXE = '/usr/lib/sendmail';
 
 ####
-sub read_deliver_conf () {
-	my $f = "$CONFDIR/deliver.conf";
+
+sub read_report_conf () {
+	my $f = "$CONFDIR/report.conf";
 	open my $h, '<', $f or do {
 		die "$f: cannot open, stopped";
 	};
-	my @categories;
-	my @recipients;
+	my @attrs;
+	my @alerts;
+	my @flash_reports;
+	my @daily_reports;
 	my %param;
-	my $directive;
+
+	my $section;
+	my $subsection;
 	my @errors;
 	while( <$h> ){
 		chomp;
 		next if m"^\s*(#|$)";
-		unless( m"^\s*(
-			category	\s+ (?<category>    \S.*) |
-			    tagmatch	\s+ (?<tagmatch>    \S.*) |
-			    eventmatch	\s+ (?<eventmatch>  \S.*) |
-			    type	\s+ (?<type>        \S.*) |
-			    receiver	\s+ (?<receiver>    \S.*) |
-			recipient	\s+ (?<recipient>   \S.*) |
-			    maxsize     \s+ (?<maxsize>     \S.*) |
-			    mininterval	\s+ (?<mininterval> \S.*) |
-			(?<paramname> MAILFROM) = (?<paramvalue> \S*)
-		)$"x ){
+		if( m"^(\w+)=(\S.*)$" ){
+			$param{$1} = $2;
+
+		##
+		}elsif( m"^\s*define_attribute$" ){
+			$section = {
+				from_tags => [],
+			};
+			push @attrs, $section;
+
+		}elsif( m"^\s*define_alert\s+(\w+)\s*$" ){
+			$section = {
+				name	=> $1,
+				maxsize     => 1000,
+				min_interval => 30,
+			};
+			push @alerts, $section;
+
+		##
+		}elsif( m"^\s*captures_anomalylogs\s*$" ){
+			$subsection = {
+			};
+			push @{$$section{from_anomalylogs}}, $subsection;
+
+		}elsif( m"^\s*captures_unmonitoredlogs\s*$" ){
+			$subsection = {
+			};
+			push @{$$section{from_unmonitoredlogs}}, $subsection;
+
+		}elsif( m"^\s*captures_trafficlogs\s*$" ){
+			$subsection = {
+			};
+			push @{$$section{from_trafficlogs}}, $subsection;
+
+		##
+		}elsif( m"^\s*(?:captures_from_tag)\s+(\S.*)$" ){
+			push @{$$section{from_tags}}, qr"^$1$";
+
+		##
+		}elsif( m"^\s*(?:marked_as|matching_mark)\s+(\S.*)$" ){
+			push @{$$subsection{marks}}, $1;
+			
+		}elsif( m"^\s*(?:not_marked_as|unmatching_mark)\s+(\S.*)$" ){
+			push @{$$subsection{nomarks}}, $1;
+
+		}elsif( m"^\s*(?:tagged_as|matching_tag)\s+(\S.*)$" ){
+			push @{$$subsection{tag_regexps}}, qr"^$1$";
+
+		}elsif( m"^\s*(?:named_as|matching_name|matching_trafficname)\s+(\S.*)$" ){
+			push @{$$subsection{trafficname_regexps}}, qr"^$1$";
+
+		}elsif( m"^\s*matching_event\s+(\S.*)$" ){
+			push @{$$subsection{event_regexps}}, qr"^$1$";
+
+		}elsif( m"^\s*matching_monitorname\s+(\S.*)$" ){
+			push @{$$subsection{monitorname_regexps}}, qr"^$1$";
+
+		}elsif( m"^\s*matching_viewpoint\s+(\S.*)$" ){
+			push @{$$subsection{viewpoint_regexps}}, qr"^$1$";
+
+		}elsif( m"^\s*(?:passing_through|matching_route)\s+(\S.*)$" ){
+			push @{$$subsection{route_regexps}}, qr"^$1$";
+
+		}elsif( m"^\s*marks_logs_as\s+(\S.*)$" ){
+			push @{$$section{mark_logs_as}}, $1;
+
+		}elsif( m"^\s*define_flash_report\s+(\w+)\s*$" ){
+			$section = {
+				name	   => $1,
+				maxsize	=> 1000,
+				min_interval   => 30,
+				sent_to	=> [],
+				contains_alert => [],
+			};
+			push @flash_reports, $section;
+
+		}elsif( m"^\s*define_daily_report\s+(\w+)\s*$" ){
+			$section = {
+				name	   => $1,
+				max_size       => 1000,
+				min_interval   => 30,
+				sent_to	=> [],
+				contains_alert => [],
+			};
+			push @daily_reports, $section;
+
+		}elsif( m"^\s*contains_alert\s+(\S.*)$" ){
+			push @{$$section{contains_alert}}, qr"^$1$";
+
+		}elsif( m"^\s*sent_to\s+(\S+)$" ){
+			push @{$$section{sent_to}}, $1;
+
+		}elsif( m"^\s*max_size\s+(\d+)$" ){
+			$$section{max_size} = 0+$1;
+
+		}elsif( m"^\s*min_interval\s+(\d+)$" ){
+			$$section{min_interval} = 0+$1;
+
+		}else{
 			push @errors, "$f:$.: illegal format.\n";
 			next;
-		}
-	
-		if    ( $+{category} ){
-			$directive = {
-				name        => $+{category},
-				type        => undef,
-				tagregexp   => qr".*",
-				eventregexp => qr".*",
-				receivers   => [],
-				maxsize     => 1000,
-				mininterval => 30,
-			};
-			push @categories, $directive;
-		}elsif( $+{recipient} ){
-			$directive = {
-				name        => $+{recipient},
-			};
-			push @recipients, $directive;
-		}elsif( $+{tagmatch} ){
-			$directive->{tagregexp} = qr"$+{tagmatch}";
-		}elsif( $+{eventmatch} ){
-			$directive->{eventregexp} = qr"$+{eventmatch}";
-		}elsif( $+{type} ){
-			$directive->{type} = $+{type};
-		}elsif( $+{receiver} ){
-			push @{$directive->{receivers}}, $+{receiver};
-		}elsif( $+{maxsize} ){
-			$directive->{maxsize} = $+{maxsize};
-		}elsif( $+{mininterval} ){
-			$directive->{mininterval} = $+{mininterval};
-		}elsif( $+{paramname} ){
-			$param{ $+{paramname} } = $+{paramvalue};
-		}else{
-			die;
 		}
 	}
 	close $h;
@@ -90,14 +157,17 @@ sub read_deliver_conf () {
 		die;
 	}
 	return {
-		categories  => [@categories],
-		recipients  => [@recipients],
-		errors	    => [@errors],
-		param       => {%param},
+		attrs		=> [@attrs],
+		alerts		=> [@alerts],
+		flash_reports	=> [@flash_reports],
+		daily_reports	=> [@daily_reports],
+		errors		=> [@errors],
+		param		=> {%param},
 	};
 }
 
-####
+#### Incremental Log Reader
+
 sub get_logstatus ($$) {
 	my ($dir, $regexp) = @_;
 	my $status = {};
@@ -161,8 +231,8 @@ sub read_partial ($$$) {
 	return $buff;
 }
 
-sub read_incremental ($$$&) {
-	my ($dir, $statusname, $regexp, $handler) = @_;
+sub read_incremental ($$$&;&) {
+	my ($dir, $statusname, $regexp, $handler, $write_or_not) = @_;
 	my $laststatus = load_logstatus $statusname;
 	my $currstatus = get_logstatus $dir, $regexp;
 	
@@ -178,10 +248,13 @@ sub read_incremental ($$$&) {
 		&$handler( $file, $partial );
 	}
 
-	store_logstatus $statusname, $currstatus;
+	unless( defined $write_or_not ){
+		store_logstatus $statusname, $currstatus;
+	}elsif( &$write_or_not() ){
+		store_logstatus $statusname, $currstatus;
+	}
 }
 
-####
 sub remove_old ($$$) {
 	my ($dir, $regexp, $limit) = @_;
 	my $now = time;
@@ -206,29 +279,344 @@ sub remove_old ($$$) {
 }
 
 ####
-sub open_and_append_message ($$$$$) {
-	my ($tag2event2fh, $prefix, $tag, $event, $message) = @_;
 
-	my $fh = $tag2event2fh->{$tag}->{$event};
-	unless( $fh ){
-		open $fh, '>>', "$prefix$tag+$event" or do {
-			die "$prefix$tag: cannot open, stopped";
-		};
-		$tag2event2fh->{$tag}->{$event} = $fh;
-	}
-	print $fh $message, "\n";
+sub sort_by_hash (\@\%) {
+	my ($list, $hash) = @_;
+	my @tmp = sort { $$hash{$b} <=> $$hash{$a} } @$list;
+	@$list = @tmp;
 }
 
-sub close_all ($) {
-	my ($tag2event2fh) = @_;
-	foreach my $event2fh ( values %$tag2event2fh ){
-		foreach my $fh ( values %$event2fh ){
-			close $fh;
+sub generate_summary ($) {
+	my ($label2cases) = @_;
+	my $total_labels;
+	my $total_cases;
+	my $total_bytes;
+	my %subtotal_cases;
+	my %subtotal_bytes;
+	my %type2labels;
+	my %type2cases;
+	my %name2labels;
+	my %name2cases;
+	my %event2labels;
+	my %event2cases;
+	while( my ($label, $cases) = each %$label2cases ){
+		$total_labels++;
+		foreach my $case ( @$cases ){
+			$total_cases++;
+			$total_bytes += length $case;
+			$subtotal_cases{$label}++;
+			$subtotal_bytes{$label} += length $case;
+		}
+
+		my $type;
+		my $name;
+		my $event;
+		if    ( $label =~ m"^(\w+):([^:]+):([^:]+):(.*)$" ){
+			$type = $1; $name = "$1:$2"; $event = "$1:$3";
+		}else{
+			die "$label, stopped";
+		}
+
+		push @{$type2labels{$type}}, $label;
+		$type2cases{$type} += @$cases;
+		push @{$name2labels{$name}}, $label;
+		$name2cases{$name} += @$cases;
+		push @{$event2labels{$event}}, $label;
+		$event2cases{$event} += @$cases;
+	}
+
+	my @types = keys %type2labels;
+	my @names = keys %name2labels;
+	my @events = keys %event2labels;
+	sort_by_hash @types, %type2cases;
+	sort_by_hash @names, %name2cases;
+	sort_by_hash @events, %event2cases;
+	while( my ($k, $v) = each %type2labels ){
+		sort_by_hash @$v, %subtotal_cases;
+	}
+	while( my ($k, $v) = each %name2labels ){
+		sort_by_hash @$v, %subtotal_cases;
+	}
+	while( my ($k, $v) = each %event2labels ){
+		sort_by_hash @$v, %subtotal_cases;
+	}
+
+	return {
+		TOTAL_LABELS => $total_labels,
+		TOTAL_CASES => $total_cases,
+		TOTAL_BYTES => $total_bytes,
+		SUBTOTAL_CASES => \%subtotal_cases,
+		SUBTOTAL_BYTES => \%subtotal_bytes,
+		TYPES => \@types,
+		NAMES => \@names,
+		EVENTS => \@events,
+		GROUP_BY_TYPE => \%type2labels,
+		GROUP_BY_NAME => \%name2labels,
+		GROUP_BY_EVENT => \%event2labels,
+	};
+}
+
+#### Output
+
+sub sendmail ($$$) {
+	my ($mail, $mailfrom, $mailto) = @_;
+	my $from_quoted = quotemeta $mailfrom;
+	my $to_quoted = quotemeta $mailto;
+	my $enc = find_encoding "utf-8";
+
+	open my $h, '|-', "$SENDMAILEXE -f $from_quoted $to_quoted" or do {
+		die "$SENDMAILEXE: cannot execute, stopped";
+	};
+	chomp $mail;
+	my @mail = split m"\n", $mail;
+	while( 1 ){
+		$_ = shift @mail;
+		last if $_ eq '';
+
+		my $text = encode_mimewords $_, Encoding => 'q', Charset => 'utf-8';
+		print $h $text, "\n";
+	}
+	print $h "MIME-Version: 1.0\n";
+	print $h "Content-Transfer-Encoding: quoted-printable\n";
+	print $h "Content-Type: text/plain; charset=utf-8\n",
+		"\n";
+	while( 1 ){
+		$_ = shift @mail;
+		last unless defined $_;
+		eval {
+			my $tmp = $_;
+			my $utf8 = $enc->decode($tmp, 1);
+		};
+		if( $@ ){
+			s{[\x80-\xff]}{'$'.uc(unpack('H2',$&))}eg;
+		}
+
+		if( m"^[\x20-\x3c\x3e-\x7e]*$" ){
+			print $h $_, "\n";
+		}else{
+			my $text = encode_qp($_);
+			print $h $text, "\n";
 		}
 	}
+	close $h;
 }
 
-####
+sub mkdir_or_die ($) {
+	my ($d) = @_;
+	return if -d $d;
+	mkdir $d or die "$d: cannot create, stopped";
+}
+
+sub rm_r_or_die ($) {
+	my ($d) = @_;
+	opendir my $h, $d or do { die "$d: cannot open, stopped"; };
+	while( my $e = readdir $h ){
+		next if $e =~ m"^(\.|\.\.)$";
+		if   ( -f "$d/$e" ){ unlink "$d/$e" or die; }
+		elsif( -l "$d/$e" ){ unlink "$d/$e" or die; }
+		elsif( -d "$d/$e" ){ rm_r_or_die( "$d/$e" ); }
+		else{ die "$d/$e: cannot remove, stopped"; }
+	}
+	close $h;
+	rmdir $d or die "$d: cannot remove, stopped";
+}
+
+sub rsync_or_die ($$) {
+	my ($src, $dst) = @_;
+	my $r = system "rsync", "-aqSx", "$src/", "$dst/";
+	if( ($r << 8) > 0 ){
+		die "$dst: cannot rsync, stopped";
+	}
+}
+
+sub link_or_die ($$) {
+	my ($src, $dst) = @_;
+	link $src, $dst or die "$dst: cannot create, stopped";
+}
+
+#### Timestamp
+
+our $TIMEZONE;
+sub get_timeperiodboundary ($) {
+	my ($period) = @_;
+	unless( defined $TIMEZONE ){
+		my $gmnow = time;
+		$TIMEZONE = timegm( localtime $gmnow ) - $gmnow;
+	}
+	my $now = time + $TIMEZONE;
+	return int($now/$period) * $period - $TIMEZONE;
+}
+
+sub date ($) {
+	my (undef, undef, undef, $day, $mon, $year) = localtime shift;
+	return sprintf "%04d-%02d-%02d", $year+1900, $mon+1, $day;
+}
+
+#### Matching
+
+sub common_set ($$) {
+	my ($left, $right) = @_;
+	my %s;
+	foreach my $i (@$left) { $s{$i} += 1; }
+	foreach my $i (@$right){ $s{$i} += 2; }
+	my (@left_only, @right_only, @common);
+	while( my ($k, $v) = each %s ){
+		if   ( $v == 1 ){ push @left_only,  $k; }
+		elsif( $v == 2 ){ push @right_only, $k; }
+		else	    { push @common,     $k; }
+	}
+	return \@left_only, \@right_only, \@common;
+}
+
+sub match_mark ($$$) {
+	my ($marks, $targets, $if_undefined) = @_;
+	return $if_undefined unless defined $targets;
+	return $if_undefined unless @$targets;
+	foreach my $target ( @$targets ){
+		return 1 if $$marks{$target};
+	}
+	return undef;
+}
+
+sub match_regexps ($$$) {
+	my ($text, $regexps, $if_undefined) = @_;
+	return $if_undefined unless defined $regexps;
+	return $if_undefined unless @$regexps;
+	foreach my $regexp ( @$regexps ){
+		return 1 if $text =~ $regexp;
+	}
+	return undef;
+}
+
+#### Read / Write / Encode / Decode
+
+sub parse_ltsv ($) {
+	my %r;
+	foreach my $i ( split m"\t", shift ){
+		die unless $i =~ m"^(\w+):(.*)$";
+		$r{$1} = $2;
+	}
+	return \%r;
+}
+
+sub write_alerts ($) {
+	my ($alerts) = @_;
+
+	my $encoder = JSON->new;
+	my $t = get_timeperiodboundary 60*60;
+	my ($sec, $min, $hour, $day, $mon, $year) = localtime $t;
+	my $timeblock = sprintf "%04d-%02d-%02d_%02d:%02d", 1900+$year, 1+$mon, $day, $hour, $min;
+	my $now = sprintf "%04d-%02d-%02d_%02d:%02d:%02d", 1900+$year, 1+$mon, $day, $hour, $min, $sec;
+
+	while( my ($k, $v) = each %$alerts ){
+		open my $h, '>>', "$ALERTDIR/$k.$timeblock.txt" or do {
+			die "$ALERTDIR/$k.$timeblock.txt: cannot open, stopped";
+		};
+		foreach my $i ( @$v ){
+			$$i{timestamp} = $now;
+			my $j = $encoder->encode( $i );
+			print $h "$j\n";
+		}
+		close $h;
+	}
+}
+
+our $JSON_CODEC;
+sub json2hash($) {
+	my ($json) = @_;
+	return undef if $json =~ m"^\s*$";
+	$JSON_CODEC = JSON->new unless defined $JSON_CODEC;
+	my $hash;
+	eval {
+		$hash = $JSON_CODEC->decode( $json );
+	};
+	return $hash;
+}
+
+sub hash2json ($) {
+	my ($hash) = @_;
+	return undef unless defined $hash;
+	$JSON_CODEC = JSON->new unless defined $JSON_CODEC;
+	my $json = $JSON_CODEC->encode( $hash );
+	return $json;
+}
+
+sub read_json ($;$$) {
+	my ($jsonfile, $fileerrorhandler, $jsonerrorhandler) = @_;
+	open my $h, '<', $jsonfile or do {
+		if( $fileerrorhandler ){
+			return &$fileerrorhandler( $jsonfile );
+		}else{
+			die "$jsonfile: cannot open, stopped";
+		}
+	};
+	my $json = <$h>;
+	close $h;
+	my $obj;
+	eval { $obj = json2hash $json; };
+	return $obj unless $@;
+
+	if( $jsonerrorhandler ){
+		return &$jsonerrorhandler( $json );
+	}else{
+		die "$jsonfile: cannot parse, stopped";
+	}
+	return undef;
+}
+
+sub write_json ($$;$) {
+	my ($jsonfile, $obj, $fileerrorhandler) = @_;
+	my $json = hash2json $obj;
+	open my $h, '>', $jsonfile or do {
+		if( $fileerrorhandler ){
+			&$fileerrorhandler( $jsonfile );
+			return undef;
+		}else{
+			die "$jsonfile: cannot open, stopped";
+		}
+	};
+	print $h $json, "\n";
+	close $h;
+}
+
+sub parse_alertlines ($) {
+	my ($alertlines) = @_;
+	my $key2values = {};
+	foreach my $line ( split m"\n+", $alertlines ){
+		my $hash = json2hash $line;
+		next unless defined $hash;
+		my $from = $$hash{from};
+		my $k;
+		my $v;
+		if    ( $from eq 'anomalylog' ){
+			$k = sprintf 'anomaly:%s:%s:%s',
+				$$hash{monitorname}, $$hash{event}, $$hash{tag};
+			$v = $$hash{message};
+		}elsif( $from eq 'trafficlog' ){
+			my $timestamp = $$hash{timestamp};
+			my $name    = $$hash{monitorname} // $$hash{viewpoint};
+			my $traffic = $$hash{traffic_name} // $$hash{boundary};
+			my $total   = $$hash{total} // $$hash{subtotal};
+			my $id      = $$hash{id} // $$hash{tag};
+			my $event   = $$hash{event} // $$hash{status};
+			$k = sprintf 'traffic:%s:-:-', $name;
+			$v = sprintf '%s trafficname:%s id:%s total:%g event:%s',
+				$timestamp, $traffic, $id, $total, $event;
+		}elsif( $from eq 'unmonitoredlog' ){
+			$k = sprintf 'unmonitored:-:-:%s',
+				$$hash{tag};
+			$v = $$hash{message};
+		}else{
+			die;	
+		}
+		push @{$$key2values{$k}}, $v;
+	}
+	return $key2values;
+}
+
+
+#### Session
+
 sub load_lastsend ($) {
 	my ($name) = @_;
 	my $f = "$STATUSDIR/lastsend.$name";
@@ -248,325 +636,699 @@ sub store_lastsend ($$) {
 	close $h;
 }
 
-####
-sub generate_snippet ($) {
-	my ($tag2event2messages) = @_;
-
-	my $full;
-	my $digest;
-	my $summary;
-	foreach my $tag ( sort keys %$tag2event2messages ){
-		my $event2messages = $tag2event2messages->{$tag};
-		foreach my $event ( sort keys %$event2messages ){
-			my $messages = $event2messages->{$event};
-
-			$full    .= sprintf "%s %s\n", $tag, $event;
-			$digest  .= sprintf "%s %s\n", $tag, $event;
-			$full   .= "________________________________________\n";
-			$digest .= "________________________________________\n";
-			my $n = 0;
-			foreach my $message ( @$messages ){
-				++$n;
-				$full   .= "$message\n";
-				$digest .= "$message\n" if $n < 3;
-			}
-			$digest .= "(...snipped)\n" unless $n < 3;
-			$full   .= "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n";
-			$digest .= "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n";
-			$summary .= sprintf "%s %s (%d)\n", $tag, $event, $n;
-		}
-	}
-	$full =~ s{[-+.\w]+\@[-.\w]+\.[-\w]+}{XXXX\@XXXXX.XXX}g;
-	$digest =~ s{[-+.\w]+\@[-.\w]+\.[-\w]+}{XXXX\@XXXXX.XXX}g;
-	return $full   if length($full) < 20000;
-	return $digest if length($digest) < 20000;
-	return $summary;
+sub read_reportinfo ($) {
+	my ($name) = @_;
+	my $f = "$STATUSDIR/reportinfo.$name";
+	my $info = read_json $f, sub { return {}; }, sub { return {}; };
+	$$info{logfiles}	 //= [];
+	$$info{create_timestamp} //= 0;
+	return $info;
 }
 
-sub generate_summary ($) {
-	my ($tag2event2messages) = @_;
+sub create_reportinfo ($$) {
+	my ($name, $info) = @_;
 
-	my $text;
-	my @summary;
-	my %event2tag2messages;
-	my %event2messages;
-	foreach my $tag ( sort keys %$tag2event2messages ){
-		my $event2messages = $tag2event2messages->{$tag};
-		foreach my $event ( sort keys %$event2messages ){
-			my $messages = @{$event2messages->{$event}};
-
-			$event2tag2messages{$event}->{$tag} = $messages;
-			$event2messages{$event} += $messages;
-		}
-	}
-	foreach my $event (
-		sort {$event2messages{$b} <=> $event2messages{$a}}
-		keys %event2messages
-	){
-		my $tag2messages = $event2tag2messages{$event};
-		my @eventsummary;
-		foreach my $tag (
-			sort {$$tag2messages{$b} <=> $$tag2messages{$a}}
-			keys %$tag2messages
-		){
-			my $messages = $$tag2messages{$tag};
-			$text .= sprintf "%-10s has been found %3d cases at %s.\n", $event, $messages, $tag;
-			push @eventsummary, {tag=>$tag, messages=>$messages};
-		}
-		push @summary, {event=>$event, summary=>[@eventsummary]};
-	}
-	return ($text, \@summary);
+	my $sid = random_regex "[0-9a-zA-Z]{32}";
+	%$info = (
+		name	     => $name,
+		sid	      => $sid,
+		create_timestamp => time,
+		update_timestamp => time,
+		logfiles	 => [],
+	);
+	return $sid;
 }
 
-####
-sub sendmail ($$$) {
-	my ($mail, $mailfrom, $mailto) = @_;
-	my $from_quoted = quotemeta $mailfrom;
-	my $to_quoted = quotemeta $mailto;
+sub write_reportinfo ($$) {
+	my ($name, $info) = @_;
+	my $f = "$STATUSDIR/reportinfo.$name";
+	write_json $f, $info;
+}
 
-	open my $h, '|-', "$SENDMAILEXE -f $from_quoted $to_quoted" or do {
-		die "$SENDMAILEXE: cannot execute, stopped";
+sub list_reportpage () {
+	my @r;
+	opendir my $h, $WWWDIR or do {
+		die "$WWWDIR: cannot open, stopped";
 	};
-	chomp $mail;
-	my @mail = split m"\n", $mail;
-	while( 1 ){
-		$_ = shift @mail;
-		last if $_ eq '';
+	while( my $e = readdir $h ){
+		next unless $e =~ m"^sess_(\w{32})$";
+		my $sid = $1;
 
-		my $text = encode_mimewords $_, Encoding => 'b', Charset => 'utf-8';
-		print $h encode_utf8($text), "\n";
+		my $obj = read_json "$WWWDIR/$e/session.json", sub { return undef; };
+		push @r, {
+			sid => $1,
+			name =>  $$obj{name},
+			create_timestamp => $$obj{create_timestamp},
+		};
 	}
-	print $h "MIME-Version: 1.0\n";
-	print $h "Content-Transfer-Encoding: 8bit\n";
-	print $h "Content-Type: text/plain; charset=utf-8\n",
-		"\n";
-	while( 1 ){
-		$_ = shift @mail;
-		last unless defined $_;
-		my $text = decode_utf8( $_ );
-		print $h encode_utf8($text), "\n";
+	close $h;
+	return @r;
+}
+
+sub remove_reportpage ($) {
+	my ($sid) = @_;
+	rm_r_or_die "$WWWDIR/sess_$sid";
+}
+
+sub generate_reportpage ($$$$$) {
+	my ($reportinfo, $global_setting, $report_setting, $template_dir, $template_file) = @_;
+
+	my $name = $$reportinfo{name};
+	my $sid  = $$reportinfo{sid};
+	my $d = "$WWWDIR/sess_$sid";
+	unless( -d $d ){
+		mkdir_or_die $d;
+		rsync_or_die "$CONFDIR/$template_dir", $d;
+	}
+	my $f = "$d/session.json";
+	unless( -f $f ){
+		write_json $f, {sid=>$sid, name=>$name, create_timestamp=>time};
+	}
+
+	my $logfiles = $$reportinfo{logfiles};
+	foreach my $logfile ( @$logfiles ){
+		next if -f "$d/$logfile";
+		link_or_die "$ALERTDIR/$logfile", "$d/$logfile";
+	}
+
+	my $t = time;
+	my ($sec, $min, $hour, $day, $mon, $year) = localtime $t;
+	my $now   = sprintf "%04d-%02d-%02d_%02d:%02d:%02d", 1900+$year, 1+$mon, $day, $hour, $min, $sec;
+	my $today = sprintf "%04d-%02d-%02d", 1900+$year, 1+$mon, $day;
+	my $hostname = hostname;
+
+	my $tt = Template->new({
+		INCLUDE_PATH => $CONFDIR,
+		OUTPUT_PATH  => $d,
+		ENCODING     => 'utf8',
+	});
+	my $var = {
+		GLOBAL_SETTING  => $global_setting,
+		REPORT_SETTING  => $report_setting,
+		REPORT_INFO     => $reportinfo,
+		LOGFILES	=> $logfiles,
+		NOW	     => $now,
+		TODAY	   => $today,
+		HOSTNAME	=> $hostname,
+	};
+	$tt->process( $template_file, $var, "index.html" ) or do {
+		die $tt->error(), ", stopped";
+	};
+}
+
+our $UTF8_CODEC;
+sub utf8safe ($) {
+	my ($text) = @_;
+	$UTF8_CODEC = find_encoding "utf-8" unless defined $UTF8_CODEC;
+	eval {
+		my $tmp = $text;
+		my $utf8 = $UTF8_CODEC->decode($tmp, 1);
+	};
+	if( $@ ){
+		s{[\x80-\xff]}{'$'.uc(unpack('H2',$&))}eg;
+	}
+	return $text;
+}
+
+sub send_reportmail ($$$$$$) {
+	my ($reportinfo, $global_setting, $report_setting,
+	    $summaries, $key2values, $template_file) = @_;
+
+	my $mailfrom = $$global_setting{MAILFROM} // "foucault03\@example.com";
+	my $tt = Template->new({
+		INCLUDE_PATH => $CONFDIR,
+		OUTPUT_PATH  => $CONFDIR,
+		ENCODING     => 'utf8',
+	});
+
+	my $t = time;
+	my ($sec, $min, $hour, $day, $mon, $year) = localtime $t;
+	my $now   = sprintf "%04d-%02d-%02d_%02d:%02d:%02d", 1900+$year, 1+$mon, $day, $hour, $min, $sec;
+	my $today = sprintf "%04d-%02d-%02d", 1900+$year, 1+$mon, $day;
+	my $hostname = hostname;
+
+	my $sent_to = $$report_setting{sent_to};
+	foreach my $mailto ( @$sent_to ){
+		my $output;
+		my $var = {
+			GLOBAL_SETTING => $global_setting,
+			REPORT_SETTING => $report_setting,
+			REPORT_INFO    => $reportinfo,
+			MAILTO   => $mailto,
+			MAILFROM => $mailfrom,
+			NOW      => $now,
+			TODAY    => $today,
+			HOSTNAME => $hostname,
+			ALERTS   => $key2values,
+			utf8safe => \&utf8safe,
+			%$summaries,
+		};
+		$tt->process( $template_file, $var, \$output ) or do {
+			die $tt->error(), ", stopped";
+		};
+		sendmail $output, $mailfrom, $mailto;
+		#print "Env-From: $mailfrom\nEnv-To: $mailto\n$output\n";
+	}
+}
+
+
+####
+
+sub get_attrs ($$) {
+	my ($conf, $tag) = @_;
+
+	my %r;
+	foreach my $rule ( @$conf ){
+		my $from_tags = $$rule{from_tags};
+
+		foreach my $regexp ( @$from_tags ){
+			next unless $tag =~ m"$regexp";
+			while( my ($k, $v) = each %+ ){
+				$r{$k} = $v;
+			}
+		}
+	}
+
+	return %r;
+}
+
+sub classify_detectedanomaly ($$$$$) {
+	my ($conf, $pattern, $tag, $event, $message) = @_;
+	my $marks = {};
+	my @r;
+	foreach my $c ( @$conf ){
+		my $name = $$c{name};
+		my $mark_logs_as = $$c{mark_logs_as} // [];
+		my $capture_settings = $$c{from_anomalylogs};
+		foreach my $capture_setting ( @$capture_settings ){
+
+			my $targets = $$capture_setting{marks};
+			next unless match_mark $marks, $targets, 1;
+			my $targets = $$capture_setting{nomarks};
+			next if match_mark $marks, $targets, undef;
+
+			my $monitorname_regexps = $$capture_setting{monitorname_regexps};
+			next unless match_regexps $pattern, $monitorname_regexps, 1;
+			my $tag_regexps = $$capture_setting{tag_regexps};
+			next unless match_regexps $tag, $tag_regexps, 1;
+			my $event_regexps = $$capture_setting{event_regexps};
+			next unless match_regexps $event, $event_regexps, 1;
+
+			foreach my $m ( @$mark_logs_as ){
+				$$marks{$m} = 1;
+			}
+			push @r, $name;
+			last;
+		}
+	}
+	return @r;
+}
+
+sub capture_anomalylogs ($$$$$$) {
+	my ($conf, $alerts, $monitorname, $tag, $event, $message) = @_;
+	my $marks = {};
+	foreach my $c ( @$conf ){
+		my $name = $$c{name};
+		my $mark_logs_as = $$c{mark_logs_as} // [];
+		my $capture_settings = $$c{from_anomalylogs};
+		foreach my $capture_setting ( @$capture_settings ){
+
+			my $targets = $$capture_setting{marks};
+			next unless match_mark $marks, $targets, 1;
+			my $targets = $$capture_setting{nomarks};
+			next if match_mark $marks, $targets, undef;
+
+			my $monitorname_regexps = $$capture_setting{monitorname_regexps};
+			next unless match_regexps $monitorname, $monitorname_regexps, 1;
+			my $tag_regexps = $$capture_setting{tag_regexps};
+			next unless match_regexps $tag, $tag_regexps, 1;
+			my $event_regexps = $$capture_setting{event_regexps};
+			next unless match_regexps $event, $event_regexps, 1;
+
+			foreach my $m ( @$mark_logs_as ){
+				$$marks{$m} = 1;
+			}
+			push @{$$alerts{$name}}, {
+				from	=> 'anomalylog',
+				monitorname => $monitorname,
+				tag	 => $tag,
+				event       => $event,
+				message     => $message,
+			};
+			last;
+		}
+	}
+}
+
+sub capture_unmonitoredlogs ($$$$) {
+	my ($conf, $alerts, $tag, $message) = @_;
+	my $marks = {};
+	foreach my $c ( @$conf ){
+		my $name = $$c{name};
+		my $mark_logs_as = $$c{mark_logs_as} // [];
+		my $capture_settings = $$c{from_unmonitoredlogs};
+		foreach my $capture_setting ( @$capture_settings ){
+
+			my $targets = $$capture_setting{marks};
+			next unless match_mark $marks, $targets, 1;
+			my $targets = $$capture_setting{nomarks};
+			next if match_mark $marks, $targets, undef;
+
+			my $tag_regexps = $$capture_setting{tag_regexps};
+			next unless match_regexps $tag, $tag_regexps, 1;
+
+			foreach my $m ( @$mark_logs_as ){
+				$$marks{$m} = 1;
+			}
+			push @{$$alerts{$name}}, {
+				from	=> 'unmonitoredlog',
+				tag	 => $tag,
+				message     => $message,
+			};
+			last;
+		}
+	}
+}
+
+sub capture_trafficlogs ($$$$$$) {
+	my ($conf, $alerts, $monitorname, $trafficname, $route, $count) = @_;
+	my $marks = {};
+	foreach my $c ( @$conf ){
+		my $name = $$c{name};
+		my $mark_logs_as = $$c{mark_logs_as} // [];
+		my $capture_settings = $$c{from_anomalylogs};
+		foreach my $capture_setting ( @$capture_settings ){
+
+			my $targets = $$capture_setting{marks};
+			next unless match_mark $marks, $targets, 1;
+			my $targets = $$capture_setting{nomarks};
+			next if match_mark $marks, $targets, undef;
+
+			my $monitorname_regexps = $$capture_setting{monitorname_regexps};
+			next unless match_regexps $monitorname, $monitorname_regexps, 1;
+			my $trafficname_regexps = $$capture_setting{trafficname_regexps};
+			next unless match_regexps $trafficname, $trafficname_regexps, 1;
+			my $route_regexps = $$capture_setting{route_regexps};
+			next unless match_regexps $route, $route_regexps, 1;
+
+			foreach my $m ( @$mark_logs_as ){
+				$$marks{$m} = 1;
+			}
+			push @{$$alerts{$name}}, {
+				from	=> 'trafficlog',
+				monitorname => $monitorname,
+				trafficname => $trafficname,
+				route       => $route,
+				count       => $count,
+			};
+			last;
+		}
+	}
+}
+
+sub capture_trafficevents ($$$$$$$) {
+	my ($conf, $alerts, $viewpoint, $tag, $status, $boundary, $subtotal) = @_;
+	my $marks = {};
+	foreach my $c ( @$conf ){
+		my $name = $$c{name};
+		my $mark_logs_as = $$c{mark_logs_as} // [];
+		my $capture_settings = $$c{from_trafficlogs};
+		foreach my $capture_setting ( @$capture_settings ){
+
+			my $targets = $$capture_setting{marks};
+			next unless match_mark $marks, $targets, 1;
+			my $targets = $$capture_setting{nomarks};
+			next if match_mark $marks, $targets, undef;
+
+			my $viewpoint_regexps = $$capture_setting{viewpoint_regexps};
+			next unless match_regexps $viewpoint, $viewpoint_regexps, 1;
+			my $tag_regexps = $$capture_setting{tag_regexps};
+			next unless match_regexps $tag, $tag_regexps, 1;
+
+			foreach my $m ( @$mark_logs_as ){
+				$$marks{$m} = 1;
+			}
+			push @{$$alerts{$name}}, {
+				from      => 'trafficlog',
+				viewpoint => $viewpoint,
+				tag       => $tag,
+				status    => $status,
+				boundary  => $boundary,
+				subtotal  => $subtotal,
+			};
+			last;
+		}
+	}
+}
+
+sub read_incremental_alert ($$$){
+	my ($name, $alertname_regexps, $handler) = @_;
+
+	my @logfiles;
+	my %key2values;
+
+	read_incremental
+		$ALERTDIR,
+		$name,
+		qr"^(\w+)\.\d{4}-\d{2}-\d{2}_\d{2}:\d{2}\.txt$",
+		sub {
+			my ($file, $diff) = @_;
+			$file =~ m"^(\w+)\." or die;
+			my $l = length $diff;
+			if($l > 1000*1000){
+				print STDERR "$file: too large hunk found ($l bytes). skipped.\n";
+				push @logfiles, $file;
+				return;
+			}
+			my $alertname = $1;
+			return unless match_regexps $alertname, $alertname_regexps, undef;
+
+			push @logfiles, $file;
+			my $k2v = parse_alertlines $diff;
+			while( my ($k, $v) = each %$k2v ){
+				push @{$key2values{$k}}, @$v;
+			}
+		}, sub {
+			return &$handler( \@logfiles, \%key2values );
+		};
+}
+
+sub parse_detected ($) {
+	my ($samples) = @_;
+	my $decoder = JSON::XS->new;
+	my @r;
+	foreach my $sample ( split m"\n", $samples ){
+		next if $sample =~ m"^\s*$";
+		utf8::decode($sample);
+		my $s = $decoder->decode( $sample );
+		my $pattern  = $$s{pattern};
+		my $unixtime = $$s{unixtime};
+		my $tag      = $$s{tag};
+		my $event    = $$s{event};
+		my $message  = $$s{message};
+		utf8::encode($message);
+		
+		push @r, [$pattern, $unixtime, $tag, $event, $message];
+	}
+	return @r;
+}
+
+sub load_detected_anomalies ($) {
+	my ($date) = @_;
+
+	my $f = "$DETECTDIR/anomaly.$date";
+	open my $h, '<', $f or do {
+		return [];
+	};
+	my $c = join '', <$h>;
+	close $h;
+
+	return parse_detected $c;
+}
+
+sub update_weeklystats ($$\@) {
+	my ($alert, $pattern, $samples) = @_;
+	my $encoder = JSON::XS->new;
+
+	my $statsfile   = "$WEEKLYSTATSDIR/$alert.$pattern.weeklystats";
+	my $rulefile    = "$WELLKNOWNSDIR/$pattern.rules";
+	my $patternfile = "$WELLKNOWNSDIR/$pattern.regexp";
+
+print "DEBUG: $pattern: ", int(@$samples), "\n";
+
+	my $cmd;
+	unless( -f $statsfile ){
+		$cmd .= "cp /dev/null $statsfile ;";
+		print "$statsfile: created.\n";
+	}
+	unless( -f $rulefile ){
+		$cmd .= "cp $CONFDIR/rules.template $rulefile ;";
+		print "$rulefile: created.\n";
+	}
+
+	$cmd .= "$BINDIR/panopticfilter analyze";
+	$cmd .= " -r $rulefile";
+	$cmd .= " -s $statsfile";
+	$cmd .= " -p $patternfile" if -f $patternfile;
+	open my $h, "|-", $cmd or do {
+		die "command \"$cmd\", stopped";
+	};
+	foreach my $sample ( @$samples ){
+		my ($unixtime, $message) = @$sample;
+		utf8::decode($message);
+		my $json = $encoder->encode( {
+			unixtime => $unixtime,
+			message => $message,
+		} );
+		utf8::encode($json);
+		print $h "$json\n";
 	}
 	close $h;
 }
 
-####
+#### Deprecated
+
+#### Sub Commands
+
 sub subcmd_cleanup ($) {
 	my ($conf) = @_;
 	remove_old
-		$SPOOLDIR, 
-		qr"^singlelinelog\..*$",
-		90 * 60;
-	remove_old
-		$ANOMALYLOGDIR, 
-		qr"^anomalylog\..*$",
-		7 * 24 * 60 * 60;
+		$ALERTDIR, 
+		qr"^(\w+)\.\d{4}-\d{2}-\d{2}_\d{2}:\d{2}\.txt$",
+		3 * 24 * 60 * 60;
+
+	my $expire_limit = time - 2 * 24 * 60 * 60;
+	my @reportpages = list_reportpage;
+	foreach my $reportpage ( @reportpages ){
+		next if $$reportpage{create_timestamp} > $expire_limit;
+		remove_reportpage $$reportpage{sid};
+	}
 }
 
-sub subcmd_prepare ($) {
+sub subcmd_build_weeklystats ($) {
 	my ($conf) = @_;
-	my $categories = $conf->{categories};
-	my $recipients = $conf->{recipients};
+	my $conf_alerts = $$conf{alerts};
+	my $conf_attrs = $$conf{attrs};
 	my $decoder = JSON->new;
-	my ($sec, $min, $hour, $day, $mon, $year) = localtime time;
-	my $today = sprintf "%04d-%02d-%02d", $year+1900, $mon+1, $day;
 
-	my $tag2event2fh = {};
+	my %alert2total;
+	my %alert2tag2subtotal;
+	my %alert2event2subtotal;
+	my %alert2tag2event2subtotal;
+	my %alert2attrname2attrvalue2subtotal;
+
+	print "cleanup...\n";
+	opendir my $d, $WEEKLYSTATSDIR or do {
+		die "$WEEKLYSTATSDIR: cannot open, stoped";
+	};
+	my @f;
+	while( my $e = readdir $d ){
+		push @f, $e if $e =~ m"^[-\w]+\.[-\w]+\.weeklystats$";
+	}
+	close $d;
+	foreach my $e (@f){ unlink "$WEEKLYSTATSDIR/$e"; }
+
+	for( my $i = 7; $i > 0; $i-- ){
+		my %alert2pattern2samples;
+		my $date = date time - $i*24*60*60;
+		my @anomalies = load_detected_anomalies $date;
+
+		print "$date totalizing...\n";
+
+		foreach my $anomaly ( @anomalies ){
+			my ($pattern, $unixtime, $tag, $event, $message) = @$anomaly;
+			my %attrs = get_attrs $conf_attrs, $tag;
+			my @alerts = classify_detectedanomaly $conf_alerts,
+				$pattern, $tag, $event, $message;
+			foreach my $alert ( @alerts ){
+				push @{$alert2pattern2samples{$alert}
+					->{$pattern}},
+					[ $unixtime, $message ];
+
+				$alert2total{$alert}++;
+				$alert2tag2subtotal{$alert}->{$tag}++;
+				$alert2event2subtotal{$alert}->{$event}++;
+				$alert2tag2event2subtotal{$alert}->{$tag,$event}++;
+
+				while( my ($k, $v) = each %attrs ){
+					$alert2attrname2attrvalue2subtotal{$alert}->{$k}->{$v}++;
+				}
+			}
+		}
+
+		print "$date analyzing...\n";
+
+		while( my ($alert, $pattern2samples) = each %alert2pattern2samples ){
+			while( my ($pattern, $samples) = each %$pattern2samples ){
+				print "$date	$alert	$pattern\n";
+				update_weeklystats $alert, $pattern, @$samples;
+			}
+		}
+	}
+	my $json = $decoder->encode( {
+		alert2total		 => \%alert2total,
+		alert2tag2subtotal	 => \%alert2tag2subtotal,
+		alert2event2subtotal 	 => \%alert2event2subtotal,
+		alert2tag2event2subtotal => \%alert2tag2event2subtotal,
+		alert2attrname2attrvalue2subotal => \%alert2attrname2attrvalue2subtotal,
+	} );
+	my $f = "$WEEKLYSTATSDIR/weeklytotal.json";
+	open my $h, ">", $f or die;
+	print $h "$json\n";
+	close $h;
+}
+
+sub subcmd_build_alerts ($) {
+	my ($conf) = @_;
+	my $conf_alerts = $$conf{alerts};
+	my $alerts = {};
+	my $decoder = JSON->new;
+
 	read_incremental
-		$ANOMALYLOGDIR,
-		"prepare",
-		qr"^anomalylog\..*$",
+		$DETECTDIR,
+		"build_alerts_from_detected_anomalies",
+		qr"^anomaly\.\d{4}-\d{2}-\d{2}$",
 		sub {
 			my ($file, $diff) = @_;
 			foreach my $r ( split m"\n+", $diff ){
 				next if $r eq '';
 				my $obj = $decoder->decode( $r );
-				my $tag = $obj->{tag};
-				my $event = $obj->{event};
-				my $message = $obj->{message};
-				$tag =~ s{^foucault03log\.}{};
-				$tag =~ s{\.\d{4}-\d{2}-\d{2}_\d{2}:\d{2}(\.\d+)?$}{};
-
-				my $delivery_is_planned;
-				foreach my $category ( @$categories ){
-					my $tagregexp = $category->{tagregexp};
-					my $eventregexp = $category->{eventregexp};
-					next unless $tag =~ m"^$tagregexp$";
-					next unless $event =~ m"^$eventregexp$";
-					$delivery_is_planned = 1;
-					last;
-				}
-				if( $delivery_is_planned ){
-					open_and_append_message $tag2event2fh,
-						"$DELIVEREDEVENTDIR/deliveredevent.$today.",
-						$tag, $event, $message;
-				}else{
-					open_and_append_message $tag2event2fh,
-						"$UNDELIVEREDEVENTDIR/undeliveredevent.$today.",
-						$tag, $event, $message;
-				}
+				my $pattern = $$obj{pattern};
+				my $tag     = $$obj{tag};
+				my $event   = $$obj{event};
+				my $message = $$obj{message};
+				capture_anomalylogs $conf_alerts, $alerts,
+					$pattern, $tag, $event, $message;
 			}
 		};
-	close_all $tag2event2fh;
 
+	read_incremental
+		$DETECTDIR,
+		"build_alerts_from_detected_traffics",
+		qr"^traffic\.\d{4}-\d{2}-\d{2}$",
+		sub {
+			my ($file, $diff) = @_;
+			foreach my $r ( split m"\n+", $diff ){
+				next if $r eq '';
+				my $obj = $decoder->decode( $r );
+				my $viewpoint = $$obj{viewpoint};
+				my $tag      = $$obj{tag};
+				my $status   = $$obj{status};
+				my $boundary = $$obj{boundary};
+				my $subtotal = $$obj{subtotal};
+				capture_trafficevents $conf_alerts, $alerts,
+					$viewpoint, $tag, $status, $boundary, $subtotal;
+			}
+		};
+
+	write_alerts $alerts;
 	exit 0;
 }
 
-sub subcmd_deliver_flash ($) {
+sub subcmd_report_flash ($) {
 	my ($conf) = @_;
-	my $categories = $conf->{categories};
-	my $recipients = $conf->{recipients};
-	my $mailfrom = $conf->{param}->{MAILFROM} // "foucault03\@example.com";
 
-	my $now = time;
-	foreach my $category ( @$categories ){
-		my $type = $category->{type};
-		next unless $type eq 'flash';
+	my $global_setting = $$conf{param};
+	my $reports = $$conf{flash_reports};
 
-		my $name = $category->{name};
-		my $mininterval = $category->{mininterval};
-		my $maxsize = $category->{maxsize};
-		my $lastsend = load_lastsend $name;
-		next unless $lastsend + $mininterval*60 < $now;
+	foreach my $report_setting ( @$reports ){
+		my $name	   = $$report_setting{name};
+		my $min_interval   = $$report_setting{min_interval};
+		my $contains_alert = $$report_setting{contains_alert};
 
-		my $tagregexp = $category->{tagregexp};
-		my $eventregexp = $category->{eventregexp};
-		my $message_exists;
-		my %tag2event2messages;
-		read_incremental
-			$DELIVEREDEVENTDIR,
-			"deliverflash.$name",
-			qr"^deliveredevent\.\d{4}-\d{2}-\d{2}\.$tagregexp\+$eventregexp$",
-			sub {
-				my ($file, $diff) = @_;
-				$file =~ m"^deliveredevent\.(\d{4}-\d{2}-\d{2})\.([^+]+)\+(.*)$" or die;
-				my $date = $1;
-				my $tag = $2;
-				my $event = $3;
-				my @messages;
-				foreach my $message ( split m"\n+", $diff ){
-					next if $message eq '';
-					push @messages, $message;
-				}
-				return unless @messages;
-				push @{$tag2event2messages{$tag}->{$event}}, @messages;
-				$message_exists = 1;
-			};
+		my $reportinfo       = read_reportinfo "flash:$name";
+		my $create_timestamp = $$reportinfo{create_timestamp};
+		my $last_logfiles    = $$reportinfo{logfiles};
 
-		next unless $message_exists;
 
-		my $snippet = generate_snippet \%tag2event2messages;
+		read_incremental_alert "flash:$name", $contains_alert, sub {
+			my ($logfiles, $key2values) = @_;
+			return undef unless @$logfiles;
+			my $summaries = generate_summary $key2values;
+			if( $create_timestamp + $min_interval*60 < time ){
+				create_reportinfo "flash:$name", $reportinfo;
+				push @{$$reportinfo{logfiles}}, @$logfiles;
+				generate_reportpage $reportinfo,
+					$global_setting, $report_setting,
+					'report_flash_html', 'report_flash_html.tt';
+				send_reportmail $reportinfo,
+					$global_setting, $report_setting,
+					$summaries, $key2values, 'report_flash_mail.tt';
+				write_reportinfo "flash:$name", $reportinfo;
+				return 1;
+			}
 
-		my $receivers = $category->{receivers};
-		foreach my $receiver ( @$receivers ){
-			my $output;
-			my $tt = Template->new({
-				INCLUDE_PATH => $CONFDIR,
-				OUTPUT_PATH => $CONFDIR
-			});
-			my $var = {
-				MAILFROM => $mailfrom,
-				MAILTO   => $receiver,
-				SNIPPET  => $snippet,
-			};
-			$tt->process( 'deliver_flash.tt', $var, \$output ) or do {
-				die $tt->error(), ", stopped";
-			};
-			sendmail $output, $mailfrom, $receiver;
-			#print $output, $MAILFROM, $receiver, "\n";
-		}
+			my ($left_only, $right_only, $common) = common_set $last_logfiles, $logfiles;
+			return undef unless @$right_only;
 
-		store_lastsend $name, $now;
+			push @{$$reportinfo{logfiles}}, @$right_only;
+			generate_reportpage $reportinfo,
+				$global_setting, $report_setting,
+				'report_flash_html', 'report_flash_html.tt';
+			$$reportinfo{update_timestamp} = time;
+			write_reportinfo "flash:$name", $reportinfo;
+			return undef;
+		};
 	}
-	exit 0;
 }
 
-sub subcmd_deliver_daily ($) {
+sub subcmd_report_daily ($) {
 	my ($conf) = @_;
-	my $categories = $conf->{categories};
-	my $recipients = $conf->{recipients};
-	my $mailfrom = $conf->{param}->{MAILFROM} // "foucault03\@example.com";
 
-	my $now = time;
-	foreach my $category ( @$categories ){
-		my $type = $category->{type};
-		next unless $type eq 'daily';
+	my $global_setting = $$conf{param};
+	my $reports = $$conf{daily_reports};
 
-		my $name = $category->{name};
-		my $tagregexp = $category->{tagregexp};
-		my $eventregexp = $category->{eventregexp};
-		my $message_exists;
-		my %tag2event2messages;
-		read_incremental
-			$DELIVEREDEVENTDIR,
-			"deliverdaily.$name",
-			qr"^deliveredevent\.\d{4}-\d{2}-\d{2}\.$tagregexp\+$eventregexp$",
-			sub {
-				my ($file, $diff) = @_;
-				$file =~ m"^deliveredevent\.(\d{4}-\d{2}-\d{2})\.([^+]+)\+(.*)$" or die;
-				my $date = $1;
-				my $tag = $2;
-				my $event = $3;
-				my @messages;
-				foreach my $message ( split m"\n+", $diff ){
-					next if $message eq '';
-					push @messages, $message;
-				}
-				return unless @messages;
-				push @{$tag2event2messages{$tag}->{$event}}, @messages;
-				$message_exists = 1;
-			};
+	foreach my $report_setting ( @$reports ){
+		my $name	   = $$report_setting{name};
+		my $min_interval   = $$report_setting{min_interval};
+		my $contains_alert = $$report_setting{contains_alert};
 
-		next unless $message_exists;
+		my $reportinfo       = read_reportinfo "daily:$name";
+		my $create_timestamp = $$reportinfo{create_timestamp};
+		my $last_logfiles    = $$reportinfo{logfiles};
 
-		my ($text, $summary) = generate_summary \%tag2event2messages;
-
-		my $receivers = $category->{receivers};
-		foreach my $receiver ( @$receivers ){
-			my $output;
-			my $tt = Template->new({
-				INCLUDE_PATH => $CONFDIR,
-				OUTPUT_PATH => $CONFDIR
-			});
-			my $var = {
-				MAILFROM => $mailfrom,
-				MAILTO   => $receiver,
-				TEXT  => $text,
-				SUMMARY  => $summary,
-			};
-			$tt->process( 'deliver_daily.tt', $var, \$output ) or do {
-				die $tt->error(), ", stopped";
-			};
-			sendmail $output, $mailfrom, $receiver;
-			#print $output, $mailfrom, $receiver, "\n";
-		}
-		store_lastsend $name, $now;
+		read_incremental_alert "daily:$name", $contains_alert, sub {
+			my ($logfiles, $key2values) = @_;
+			return undef unless @$logfiles;
+			my $summaries = generate_summary $key2values;
+			create_reportinfo "daily:$name", $reportinfo;
+			push @{$$reportinfo{logfiles}}, @$logfiles;
+			generate_reportpage $reportinfo,
+				$global_setting, $report_setting,
+				'report_daily_html', 'report_daily_html.tt';
+			send_reportmail $reportinfo,
+				$global_setting, $report_setting,
+				$summaries, $key2values, 'report_daily_mail.tt';
+			write_reportinfo "daily:$name", $reportinfo;
+			return 1;
+		};
 	}
-	exit 0;
 }
 
-my $conf = read_deliver_conf;
+my $conf = read_report_conf;
 if    ( $ARGV[0] eq 'cleanup' ){
 	subcmd_cleanup $conf;
-}elsif( $ARGV[0] eq 'prepare' ){
-	subcmd_prepare $conf;
-}elsif( $ARGV[0] eq 'deliver_flash' ){
-	subcmd_deliver_flash $conf;
-}elsif( $ARGV[0] eq 'deliver_daily' ){
-	subcmd_deliver_daily $conf;
+}elsif( $ARGV[0] eq 'build_alerts' ){
+	subcmd_build_alerts $conf;
+}elsif( $ARGV[0] eq 'build_weeklystats' ){
+	subcmd_build_weeklystats $conf;
+}elsif( $ARGV[0] eq 'report_flash' ){
+	subcmd_report_flash $conf;
+}elsif( $ARGV[0] eq 'report_daily' ){
+	subcmd_report_daily $conf;
 }else{
 	print	"usage: % $0 ACTION\n",
 		"\n",
 		"    ACTION\n",
 		"	cleanup\n",
-		"	prepare\n",
-		"	deliver_flash\n",
-		"	deliver_daily\n",
+		"	build_alerts\n",
+		"	build_weeklystats\n",
+		"	report_flash\n",
+		"	report_daily\n",
+		"	report_weekly\n",
 		"\n";
 	exit 0;
 }
 
-
 exit 0;
-
- 
 

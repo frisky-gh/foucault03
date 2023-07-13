@@ -1,0 +1,18 @@
+
+
+concat_rule
+	target		log\.tomcat\..*\.catalina\..*
+	type		pattern-first
+	pattern		\d{4}\/\d{2}\/\d{2}.\d{2}:\d{2}:\d{2}\.\d{3}.*
+
+
+concat_rule
+	target		log\.node\..*\.access\..*
+	type		pattern-first
+	pattern		\[\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}\.\d{3}\].*
+
+concat_rule
+	target		log\.jetty\..*\.stderrout\..*
+	pattern		[^\s].*
+
+

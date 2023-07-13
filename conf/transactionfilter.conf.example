@@ -1,0 +1,29 @@
+
+transaction_rule
+	input	log\.apache\..*access.*
+	output	WebAccess
+
+transaction_rule
+	input	log\.apache\..*access.*
+	output	WebAccess.client.<ClientIPAddr>
+	message_pattern	(?<ClientIPAddr>\d+\.\d+\.\d+\.\d+)\s.*
+
+transaction_rule
+	input	.*
+	output 	AllMessage
+
+transaction_rule
+	input	.*
+	output 	AllMessage.type.<LogType>
+	tag_pattern	^(?<LogType>[-\w]+\.[-\w]+\.[-\w]+\.[-\w]+)(\..*)?
+
+transaction_rule
+	input	.*syslog.*
+	output	IPTablesMessage
+	message_pattern	.*IPTABLES_IN_REJECT:.*
+
+
+transaction_rule
+	input	.*fluent.*
+	output	FluentMessage
+

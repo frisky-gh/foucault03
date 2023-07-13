@@ -1,19 +1,21 @@
 
 
-replace	(\d+\.\d+\.\d+\.\d+)
+ignore	(?:\d+\.\d+\.\d+\.\d+)
 
-replace \d{2}/(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/\d{4}:\d{2}:\d{2}:\d{2}\s[-+]\d{4}
+ignore	\d{2}/(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/\d{4}:\d{2}:\d{2}:\d{2}\s[-+]\d{4}
 
-replace (0x[0-9a-f]+)
-replace	([0-9a-f]{4,}-[0-9a-f]{4,})
-replace	(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})
-replace	(?:(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})
+ignore	(?:0x[0-9a-f]+)
+ignore	(?:[0-9a-f]{4,}-[0-9a-f]{4,})
+ignore	(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})
+ignore	(?:(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})
 
-replace	(\d{2,}\.\d+)
-replace	(\d{2,})		\d+
+ignore	(?:\d{2,}\.\d+)
+ignore	(?:\d{2,})
+	as	\d+
 
 
-replace	([fF]{4,})		[0-9a-fA-F]{4,}
+ignore	(?:[fF]{4,})
+	as	[0-9a-fA-F]{4,}
 
 
 

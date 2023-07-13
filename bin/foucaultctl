@@ -1,23 +1,39 @@
 #!/usr/bin/perl
 
 use strict;
+use English;
 use Cwd "abs_path";
 use Template;
+use Getopt::Long qw(:config posix_default no_ignore_case gnu_compat);
+use JSON::XS;
 
 $0 =~ m"^(.*)/";
 our $TOOLHOME = abs_path( "$1/.." // '..' );
 our $CONFDIR                 = "$TOOLHOME/conf";
 our $BINDIR                  = "$TOOLHOME/bin";
 our $TMPDIR                  = "$TOOLHOME/tmp";
-our $SPOOLDIR                = "$TOOLHOME/spool";
 our $STATUSDIR               = "$TOOLHOME/status";
 our $LOGDIR                  = "$TOOLHOME/log";
+our $WELLKNOWNSDIR           = "$TOOLHOME/conf/wellknowns";
+our $DETECTDIR               = "$TOOLHOME/detect";
+
+#### deprecated
+our $SPOOLDIR                = "$TOOLHOME/spool";
 our $ANOMALYLOGDIR           = "$TOOLHOME/anomalylog";
+our $TRAFFICLOGDIR           = "$TOOLHOME/trafficlog";
 our $UNMONITOREDLOGDIR       = "$TOOLHOME/unmonitoredlog";
 our $CAPTUREDLOGDIR          = "$TOOLHOME/capturedlog";
 our $MULTILINE2SINGLELINEDIR = "$TOOLHOME/multiline2singleline";
-our $PATTERNSDIR             = "$TOOLHOME/conf/patterns";
 our $FLUENTDCONFDIR          = "$TOOLHOME/conf/fluentd";
+our $TRAFFICSDIR             = "$TOOLHOME/conf/traffics";
+our $GARAGEDIR               = "$TOOLHOME/garage";
+our $CATALOGUEDIR             = "$TOOLHOME/catalogue";
+####
+
+our $CONCATFILTER_CONFFILE      = "$CONFDIR/concatfilter.conf";
+our $ANOMALYMONITOR_CONFFILE    = "$CONFDIR/anomalymonitor.conf";
+our $TRANSACTIONFILTER_CONFFILE = "$CONFDIR/transactionfilter.conf";
+our $TRAFFICMONITOR_CONFFILE    = "$CONFDIR/trafficmonitor.conf";
 
 ####
 sub get_logstatus ($$) {
@@ -103,8 +119,27 @@ sub read_incremental ($$$&) {
 	store_logstatus $statusname, $currstatus;
 }
 
+sub time2string ($) {
+	my ($time) = @_;
+	my ($sec, $min, $hour, $day, $mon, $year) = localtime $time;
+	return sprintf("%04d-%02d-%02d_%02d:%02d:%02d",
+		$year+1900, $mon+1, $day, $hour, $min, $sec); 
+}
+
+sub read_statisticsfile ($) {
+	my ($file) = @_;
+	my $stats = {};
+	if( open my $h, '<', $file ){
+		my $json = join '', <$h>;
+		close $h;
+		my $decoder = JSON::XS->new;
+		$stats = $decoder->decode( $json );
+        }
+	return $stats;
+}
+
 ####
-sub remove_wildcard ($) {
+sub glob2fixed ($) {
 	my @fields;
 	foreach my $field ( split m"\.", $_[0] ){
 		next if $field eq '**';
@@ -115,7 +150,7 @@ sub remove_wildcard ($) {
 	return join ".", @fields;
 }
 
-sub wildcard2regexp ($) {
+sub glob2regexp ($) {
 	my @fields;
 	foreach my $field ( split m"\.", $_[0] ){
 		if    ( $field eq '**' ){ push @fields, ".*";
@@ -126,80 +161,106 @@ sub wildcard2regexp ($) {
 	return qr"^$regexp$";
 }
 
-sub tag2singlelinelogregexp ($) {
-	my ($tag_including_wildcard) = @_;
-	return wildcard2regexp $tag_including_wildcard;
+sub tagglob2singlelinelogregexp ($) {
+	my ($tagglob) = @_;
+	return glob2regexp $tagglob;
 }
 
-sub tag2anomalylogregexp ($) {
-	my ($tag_including_wildcard) = @_;
-	my $tag = quotemeta remove_wildcard $tag_including_wildcard;
+sub tagglob2anomalylogregexp ($) {
+	my ($tagglob) = @_;
+	my $tag = quotemeta glob2fixed $tagglob;
 	return qr"^$tag\.\d{4}-\d{2}-\d{2}(\.\d+)?$";
 }
 
-sub read_fluentd_conf () {
-	my $f = "$CONFDIR/fluentd.conf";
+sub read_monitor_conf () {
+	my $f = "$CONFDIR/monitor.conf";
 	open my $h, '<', $f or do {
 		die "$f: cannot open, stopped";
 	};
-	my @ignore;
+	my @trashbox;
 	my @multiline2singleline;
 	my @anomalymonitor;
-	my $directive;
+	my @trafficmonitor;
 	my @errors;
+	my $context;
 	while( <$h> ){
 		chomp;
 		next if m"^\s*(#|$)";
-		unless( m"^\s*(
-			ignore         \s+ (?<ignore>   \S.*) |
-			multiline2singleline   \s+ (?<multiline2singleline>   \S.*) |
-			anomalymonitor \s+ (?<anomalymonitor> \S.*) |
-			firstline      \s+ (?<firstline>      \S.*) |
-			pattern        \s+ (?<pattern>        \S.*) |
-			command        \s+ (?<command>        \S.*)
-		)$"x ){
-			print STDERR "$f:$.: illegal format, stopped";
+	
+		if    (	m"^\s*define_trashbox\s*" ){
+			$context = {
+				type => 'trashbox',
+				name => undef,
+			};
+			next;
+		}elsif( m"^\s*define_multiline2singleline\s*$" ){
+			$context = {
+				type => 'multiline2singleline',
+				name => undef,
+			};
+			next;
+		}elsif( m"^\s*define_anomalymonitor\s+([-\w]+)\s*$" ){
+			$context = {
+				type => 'anomalymonitor',
+				name => $1,
+			};
+			next;
+		}elsif( m"^\s*define_trafficmonitor\s+([-\w]+)\s*$" ){
+			$context = {
+				type => 'trafficmonitor',
+				name => $1,
+			};
+			next;
+		}elsif( m"^\s*parses_head_of_block_as\s+(\S.*)$" ){
+			$$context{firstline} = $1;
+			next;
+		}elsif( m"^\s*calls\s+(\S.*)$" ){
+			$$context{command} = $1;
+			next;
+		}elsif( m"^\s*captures\s+(\S.*)$" ){
+			# continue to following block
+		}else{
+			print STDERR "$f:$.: illegal format.\n";
 			next;
 		}
-	
-		if    ( $+{ignore} ){
-			$directive = {
-				type      => 'ignore',
-				tag       => $+{ignore},
-			};
-			push @ignore, $directive;
-		}elsif( $+{multiline2singleline} ){
-			$directive = {
-				type      => 'multiline2singleline',
-				tag       => $+{multiline2singleline},
-				tagfixed  => remove_wildcard $+{multiline2singleline},
-			};
+
+		# when "captures ..."
+		next unless $context;
+		my $type = $$context{type};
+		my $name = $$context{name};
+		my $tagglob = $1;
+		my $directive = {
+			type        => $type,
+			name        => $name,
+			context     => $context,
+			tagglob     => $tagglob,
+			tagfixed    => glob2fixed $tagglob,
+			outputlogregexp
+				=> tagglob2anomalylogregexp $tagglob,
+			inputlogregexp
+				=> tagglob2singlelinelogregexp $tagglob,
+		};
+		if    ( $type eq 'trashbox' ){
+			push @trashbox, $directive;
+		}elsif( $type eq 'multiline2singleline' ){
 			push @multiline2singleline, $directive;
-		}elsif( $+{anomalymonitor} ){
-			$directive = {
-				type      => 'anomalymonitor',
-				tag       => $+{anomalymonitor},
-				tagfixed  => remove_wildcard $+{anomalymonitor},
-				outputlogregexp
-				=> tag2anomalylogregexp $+{anomalymonitor},
-				inputlogregexp
-				=> tag2singlelinelogregexp $+{anomalymonitor},
-				pattern       => 'none',
-				patternfile   => "$PATTERNSDIR/none.pattern",
-			};
+		}elsif( $type eq 'anomalymonitor' ){
 			push @anomalymonitor, $directive;
-		}elsif( $+{firstline} ){
-			$directive->{firstline} = $+{firstline};
-		}elsif( $+{pattern} ){
-			my $f = "$PATTERNSDIR/$+{pattern}.pattern";
-			$directive->{pattern} = $+{pattern};
-			$directive->{patternfile} = $f;
+			my $f = "$WELLKNOWNSDIR/$name.regexp";
 			push @errors, "$f: not found." unless -f $f;
-		}elsif( $+{command} ){
-			my $f = "$MULTILINE2SINGLELINEDIR/$+{command}";
-			$directive->{command} = $+{command};
-			$directive->{commandfile} = $f;
+			$$directive{regexp} = $name;
+			$$directive{regexpfile} = $f;
+		}elsif( $type eq 'trafficmonitor' ){
+			push @trafficmonitor, $directive;
+			my $f = "$TRAFFICSDIR/$name.conf";
+			my $l = "$TRAFFICLOGDIR/$name-%y-%m-%d.ltsv";
+			my $d = "$TRAFFICLOGDIR/$name";
 			push @errors, "$f: not found." unless -f $f;
+			push @errors, "$d: cannot create." unless -d $d or mkdir $d;
+			$$directive{traffic} = $name;
+			$$directive{conffile} = $f;
+			$$directive{logfile} = $l;
+			$$directive{trafficlogdir} = $d;
 		}else{
 			die;
 		}
@@ -207,275 +268,559 @@ sub read_fluentd_conf () {
 	close $h;
 
 	return {
-		ignore		     => [@ignore],
+		trashbox	     => [@trashbox],
 		multiline2singleline => [@multiline2singleline],
 		anomalymonitor	     => [@anomalymonitor],
+		trafficmonitor	     => [@trafficmonitor],
 		errors		     => [@errors],
 	};
 }
  
-sub subcmd_build_fluentd_conf ($) {
-	my ($conf) = @_;
+sub get_garage_index () {
+	my @r;
+	opendir my $d, $GARAGEDIR or do {
+		die "$GARAGEDIR: cannot open. stopped";
+	};
+	while( my $e = readdir $d ){
+		next if $e =~ m"^\.";
+		next unless $e =~ m"^([-.\w]+)\.stats$";
+		push @r, $1;
+	}
+	close $d;
+	return @r;
+}
 
-	if( @{$conf->{errors}} ){
-		foreach my $error ( @{$conf->{errors}} ){
-			print "$error\n";
+sub get_catalogue_index () {
+	my @r;
+	opendir my $d, $CATALOGUEDIR or do {
+		die "$CATALOGUEDIR: cannot open. stopped";
+	};
+	while( my $e = readdir $d ){
+		next if $e =~ m"^\.";
+		next unless $e =~ m"^([-.\w]+)\.samples$";
+		push @r, $1;
+	}
+	close $d;
+	return @r;
+}
+
+#### test confs
+
+sub read_regexpfile ($) {
+	my ( $f ) = @_;
+	open my $h, '<', $f or do {
+		print "read_regexpfile: $f: cannot read.\n";
+		return undef, undef;
+	};
+	my ($dev, $ino, $mode, $nlink, $uid, $gid, $rdev, $size,
+	    $atime, $mtime, $ctime, $blksize, $blocks) = stat $h;
+	my $regexp = join '', <$h>;
+	chomp $regexp;
+	close $h;
+	my $regexp_compiled;
+	eval {
+		$regexp_compiled = qr"^$regexp$";
+	};
+	unless( defined $regexp_compiled ){
+		print "read_regexpfile: $f: cannot compile.\n";
+		return undef, undef;
+	}
+	return $regexp_compiled, $mtime;
+}
+
+sub test_concatfilter_conf () {
+	my @conf;
+	my $rule;
+	open my $h, '<', $CONCATFILTER_CONFFILE or do {
+		die "cannot open $CONCATFILTER_CONFFILE: $OS_ERROR, stopped";
+	};
+	while (<$h>) {
+		next if m"^\s*(#|$)";
+		if    ( m"^\s*concat_rule\s*$" ){
+			$rule = {
+				'name' => "$CONCATFILTER_CONFFILE:$.",
+				'type' => 'pattern-first',
+				'limit_line' => 100,
+				'limit_time' => 10*60,
+			};
+			push @conf, $rule;
+		}elsif( m"^\s*target\s+(\S.*)$" ){
+			push @{$$rule{targets}}, qr"^($1)$";
+		}elsif( m"^\s*pattern\s+(\S.*)$" ){
+			push @{$$rule{patterns}}, qr"^($1)$";
+		}elsif( m"^\s*type\s+(\S.*)$" ){
+			$$rule{type} = $1;
+		}else{
+			print STDERR
+				"$CONCATFILTER_CONFFILE:$.: illegal format, ignored.\n";
 		}
-		exit 1;
 	}
+	close $h or do {
+		die "close failed for $CONCATFILTER_CONFFILE: $OS_ERROR, stopped";
+	};
+	return \@conf;
+}
 
-	my $var = {
-		ignore               => $conf->{ignore},
-		multiline2singleline => $conf->{multiline2singleline},
-		anomalymonitor       => $conf->{anomalymonitor},
-		PANOPTICFILTER       => "$BINDIR/panopticfilter",
-		SPOOLDIR             => $SPOOLDIR,
-		STATUSDIR            => $STATUSDIR,
-		ANOMALYLOGDIR        => $ANOMALYLOGDIR,
-		UNMONITOREDLOGDIR    => $UNMONITOREDLOGDIR,
+sub test_anomalymonitor_conf () {
+	my @conf;
+	my $rule;
+	my $redirect;
+	open my $h, '<', $ANOMALYMONITOR_CONFFILE or do {
+		die "cannot open $ANOMALYMONITOR_CONFFILE: $OS_ERROR, stopped";
 	};
-	my $tt = Template->new({
-		INCLUDE_PATH => $CONFDIR,
-		OUTPUT_PATH => $FLUENTDCONFDIR,
-	});
-	$tt->process( 'fluentd.tt', $var, 'fluentd_foucault03.conf' ) or do {
-		die $tt->error(), ", stopped";
+	while (<$h>) {
+		next if m"^\s*(#|$)";
+		if    ( m"^\s*anomalymonitor_rule\s*$" ){
+			$rule = { 'name' => "$ANOMALYMONITOR_CONFFILE:$." };
+			push @conf, $rule;
+		}elsif( m"^\s*target\s+(\S.*)$" ){
+			my $re;
+			eval { $re = qr"^($1)$"; };
+			if( $@ ){ die "$ANOMALYMONITOR_CONFFILE:$.: $@, stopped"; }
+			push @{$$rule{targets}}, $re;
+		}elsif( m"^\s*pattern\s+(\S.*)$" ){
+			$$rule{pattern} = $1;
+			my $f = "$WELLKNOWNSDIR/$1.regexp";
+			$$rule{pattern_file} = $f;
+			my ($regexp, $mtime) = read_regexpfile $f;
+			unless( defined $regexp ){
+				print STDERR "$ANOMALYMONITOR_CONFFILE:$.:" .
+					"$f: cannot open.\n";
+				$$rule{pattern_mtime} = undef;
+				$$rule{pattern_regexp} = undef;
+				next;
+			}
+			$$rule{pattern_mtime} = $mtime;
+			$$rule{pattern_regexp} = $regexp;
+			print "anomalymonitor_conf: $f: loaded.\n";
+		}elsif( m"^\s*redirect\s+(\S.*)$" ){
+			$redirect = {
+				'name' => "$ANOMALYMONITOR_CONFFILE:$.",
+				'event' => $1,
+			};
+			push @{$$rule{redirects}}, $redirect;
+		}elsif( m"^\s*tag\s+(\S.*)$" ){
+			$$redirect{tag} = $1;
+		}elsif( m"^\s*message\s+(\S.*)$" ){
+			$$redirect{message} = $1;
+		}else{
+			print STDERR "$ANOMALYMONITOR_CONFFILE:$.:" .
+				" illegal format, ignored.\n";
+		}
+	}
+	close $h or do {
+		die "close failed for $ANOMALYMONITOR_CONFFILE: $OS_ERROR, stopped";
 	};
+	return \@conf;
+}
+
+sub test_report_conf () {
+	my $f = "$CONFDIR/report.conf";
+	open my $h, '<', $f or do {
+		die "$f: cannot open, stopped";
+	};
+	my @alerts;
+	my @flash_reports;
+	my @daily_reports;
+	my %param;
+
+	my $section;
+	my $subsection;
+	my @errors;
+	while( <$h> ){
+		chomp;
+		next if m"^\s*(#|$)";
+		if( m"^(\w+)=(\S.*)$" ){
+			$param{$1} = $2;
+		}elsif( m"^\s*define_alert\s+(\w+)\s*$" ){
+			$section = {
+				name        => $1,
+				maxsize     => 1000,
+				min_interval => 30,
+			};
+			push @alerts, $section;
+
+		}elsif( m"^\s*captures_anomalylogs\s*$" ){
+			$subsection = {
+			};
+			push @{$$section{from_anomalylogs}}, $subsection;
+
+		}elsif( m"^\s*captures_unmonitoredlogs\s*$" ){
+			$subsection = {
+			};
+			push @{$$section{from_unmonitoredlogs}}, $subsection;
+
+		}elsif( m"^\s*captures_trafficlogs\s*$" ){
+			$subsection = {
+			};
+			push @{$$section{from_trafficlogs}}, $subsection;
+
+		}elsif( m"^\s*(?:marked_as|matching_mark)\s+(\S.*)$" ){
+			push @{$$subsection{marks}}, $1;
+			
+		}elsif( m"^\s*(?:not_marked_as|unmatching_mark)\s+(\S.*)$" ){
+			push @{$$subsection{nomarks}}, $1;
+
+		}elsif( m"^\s*(?:tagged_as|matching_tag)\s+(\S.*)$" ){
+			push @{$$subsection{tag_regexps}}, qr"^$1$";
+
+		}elsif( m"^\s*(?:named_as|matching_name|matching_trafficname)\s+(\S.*)$" ){
+			push @{$$subsection{trafficname_regexps}}, qr"^$1$";
+
+		}elsif( m"^\s*matching_event\s+(\S.*)$" ){
+			push @{$$subsection{event_regexps}}, qr"^$1$";
+
+		}elsif( m"^\s*matching_monitorname\s+(\S.*)$" ){
+			push @{$$subsection{monitorname_regexps}}, qr"^$1$";
+
+		}elsif( m"^\s*(?:passing_through|matching_route)\s+(\S.*)$" ){
+			push @{$$subsection{route_regexps}}, qr"^$1$";
+
+		}elsif( m"^\s*marks_logs_as\s+(\S.*)$" ){
+			push @{$$section{mark_logs_as}}, $1;
+
+		}elsif( m"^\s*define_flash_report\s+(\w+)\s*$" ){
+			$section = {
+				name           => $1,
+				maxsize        => 1000,
+				min_interval   => 30,
+				sent_to        => [],
+				contains_alert => [],
+			};
+			push @flash_reports, $section;
+
+		}elsif( m"^\s*define_daily_report\s+(\w+)\s*$" ){
+			$section = {
+				name           => $1,
+				max_size       => 1000,
+				min_interval   => 30,
+				sent_to        => [],
+				contains_alert => [],
+			};
+			push @daily_reports, $section;
+
+		}elsif( m"^\s*contains_alert\s+(\S.*)$" ){
+			push @{$$section{contains_alert}}, qr"^$1$";
+
+		}elsif( m"^\s*sent_to\s+(\S+)$" ){
+			push @{$$section{sent_to}}, $1;
+
+		}elsif( m"^\s*max_size\s+(\d+)$" ){
+			$$section{max_size} = 0+$1;
+
+		}elsif( m"^\s*min_interval\s+(\d+)$" ){
+			$$section{min_interval} = 0+$1;
+
+		}else{
+			push @errors, "$f:$.: illegal format.\n";
+			next;
+		}
+	}
+	close $h;
+
+	if( @errors ){
+		foreach my $error ( @errors ){
+			print STDERR $error, "\n";
+		}
+		die;
+	}
+	return {
+		alerts         => [@alerts],
+		flash_reports  => [@flash_reports],
+		daily_reports  => [@daily_reports],
+		errors	       => [@errors],
+		param          => {%param},
+	};
+}
+ 
+sub test_wellknown_rules_conf ($) {
+	my ($conffile) = @_;
+	my $mark = "rule0000";
+	my %mark2replace;
+	my @res;
+	open my $h, '<', $conffile or die "$conffile: cannot open, stopped";
+
+	while( <$h> ){
+		chomp;
+		s{^\s*}{}g;
+		next if m{^\s*($|#)};
+		my @c = split m{\s+};
+		if( m"^\s*(ignore|replace)\s+(\S.*)$" ){
+			my $pattern = $2;
+			eval { qr"$pattern"; };
+			unless( $@ eq "" ){
+				print STDERR "$conffile:$.: syntax error. \n";
+				print STDERR "$conffile:$.: $@\n";
+				next;
+			}
+			push @res, "$pattern(*:$mark)";
+			$mark2replace{$mark} = $pattern;
+			$mark++;
+		}elsif( m"^\s*(as|with)\s+(\S.*)$" ){
+			my $pattern = $2;
+			eval { qr"$pattern"; };
+			unless( $@ eq "" ){
+				print STDERR "$conffile:$.: syntax error. \n";
+				print STDERR "$conffile:$.: $@\n";
+				next;
+			}
+			my $lastmark = $mark;
+			$lastmark--;
+			$mark2replace{$lastmark} = $pattern;
+		}else{
+			print STDERR "$conffile:$.: syntax error.\n";
+			next;
+		}
+	}
+	close $h;
+	my $re = "(" . join("|", @res) . ")";
+
+	eval { qr"$re"; };
+	if( $@ ){
+		print STDERR "$conffile:$.: $re\n";
+		die "$conffile:$.: cannot compile, stopped";
+		next;
+	}
+	return qr"$re", %mark2replace;
+}
+
+sub test_wellknown_regexp_conf ($) {
+	my ($regexpfile) = @_;
+        open my $h, '<', $regexpfile or die "$regexpfile: cannot open, stopped";
+	my $pattern = join '', <$h>;
+	close $h;
+	chomp $pattern;
+	return qr"^$pattern$";
+}
+
+sub test_traffic_conf ($) {
+	my ($conffile) = @_;
+	my @transaction_defs;
+	my @traffic_defs;
+	my %transaction2traffics;
+
+	my $context;
+	my $block;
+	my $subblock;
+
+	open my $h, '<', $conffile or die "$conffile: cannot open, stopped";
+	while( <$h> ){
+		chomp;
+		s{^\s*}{}g;
+		next if m{^($|#)};
+		if    ( m"^\s*define_simple_transaction\s+(\w+)\s*$" ){
+			$context = 'simple_transaction';
+			$block = { type => 'simple', name => $1 };
+			push @transaction_defs, $block;
+			
+		}elsif( m"^\s*define_multiline_transaction\s+(\w+)\s*$" ){
+			$context = 'multiline_transaction';
+			$block = { type => 'multiline', name => $1 };
+			push @transaction_defs, $block;
+			
+		}elsif( m"^\s*captures_logs_tagged_as\s+(\S.*)$" ){
+			push @{$$block{tag_regexps}}, qr"$1";
+
+		}elsif( m"^\s*captures_logs_saying\s+(\S.*)$" ){
+			push @{$$block{message_regexps}}, qr"$1";
+
+		}elsif( m"^\s*begin_message\s+(\S.*)$" ){
+			push @{$$block{begin_message_regexps}}, qr"$1";
+
+		}elsif( m"^\s*end_message\s+(\S.*)$" ){
+			push @{$$block{end_message_regexps}}, qr"$1";
+
+		}elsif( m"^\s*identified_by\s+(\w+(,\w+)*)\s*$" ){
+			$$block{identified_by} = [split m",", $1];
+
+		}elsif( m"^\s*define_traffic\s+([/\w]+)\s*$" ){
+			$context = 'traffic';
+			$block = {
+				name => $1,
+				trigger_defs => [],
+				treats       => [],
+			};
+			push @traffic_defs, $block;
+
+		}elsif( m"^\s*treats\s+(\w+)\s*$" ){
+			push @{$$block{treats}}, $1;
+			push @{$transaction2traffics{$1}}, $block;
+
+		}elsif( m"^\s*counted_by_each\s+(\w+(,\w+)*)\s*$" ){
+			$$block{counted_by_each} = [split m",", $1];
+
+		}elsif( m"^\s*during_last\s+(\d+)(m|h|d)?\s*$" ){
+			my $during_last = $1 * 60;
+			$during_last *= 60      if $2 eq 'h';
+			$during_last *= 24 * 60 if $2 eq 'd';
+			$$block{during_last} = $during_last;
+
+		}elsif( m"^\s*define_trigger(\s+([\w]+))?\s*$" ){
+			$context = 'trigger';
+			$subblock = { name => $2 };
+			push @{$$block{trigger_defs}}, $subblock;
+
+		}elsif( m"^\s*causes\s+(\S.*)\s*$" ){
+			$$subblock{causes} = $1;
+
+		}elsif( m"^\s*pulled_if_total_exceeds\s+(\d+)\s*$" ){
+			$$subblock{if_exceeds} = $1;
+
+		}elsif( m"^\s*pulled_unless_total_exceeds\s+(\d+)\s*$" ){
+			$$subblock{unless_exceeeds} = $1;
+
+		}elsif( m"^\s*pulled_if_not_exists\s+(\S.*)$" ){
+			$$subblock{if_not_exists} = $1;
+
+		}elsif( m"^\s*targets\s+(\S.*)$" ){
+			push @{$$subblock{rules}}, ['target', qr"$1"];
+
+		}elsif( m"^\s*ignores\s+(\S.*)$" ){
+			push @{$$subblock{rules}}, ['ignore', qr"$1"];
+
+		}else{
+			die "$conffile:$.: illegal format, stopped";
+		}
+	}
+	close $h;
+
+	return {
+		transaction_defs => \@transaction_defs,
+		traffic_defs     => \@traffic_defs,
+		transaction2traffics => \%transaction2traffics,
+	};
+}
+
+#### sub-commands
+
+sub subcmd_test_confs () {
+	my $monitor_conf = test_anomalymonitor_conf;
+	my $concatfilter_conf  = test_concatfilter_conf;
+	my $report_conf = test_report_conf;
+	# TODO: tepmlates
+	# TODO: regexps
+
+	opendir my $h, $WELLKNOWNSDIR or do {
+		die "$WELLKNOWNSDIR: illegal format, stopped";
+	};
+	while( my $e = readdir $h ){
+		if( $e =~ m"^\w+\.rules$" ){
+			my $rules_conf = test_wellknown_rules_conf "$WELLKNOWNSDIR/$e";
+		}elsif( $e =~ m"^\w+\.regexp$" ){
+			my $regexp_conf = test_wellknown_regexp_conf "$WELLKNOWNSDIR/$e";
+		}
+	}
+	close $h;
+
+	opendir my $h, $TRAFFICSDIR or do {
+		die "$TRAFFICSDIR: illegal format, stopped";
+	};
+	while( my $e = readdir $h ){
+		next unless $e =~ m"^\w+\.conf$";
+		my $traffic_conf = test_traffic_conf "$TRAFFICSDIR/$e";
+	};
+	close $h;
 	exit 0;
 }
 
-sub subcmd_capture_anomalylog ($) {
-	my ($conf) = @_;
+sub _unmonitoredlog2monitor ($$) {
+	my ($conf, $f) = @_;
+	return undef, undef unless $f =~ m"^foucault03log\.(.*)_\d{4}-\d{2}-\d{2}\.log$";
+	my $basename = $1;
+
+	foreach my $m ( @{ $$conf{anomalymonitor} } ){
+		my $monitorname = $$m{name};
+		my $regexp      = $$m{inputlogregexp};
+		my $fixed       = $$m{tagfixed};
+		my $pattern     = $$m{pattern};
+		next unless $basename =~ $regexp;
+		next unless defined $monitorname;
+		return $basename, $monitorname;
+	}
+
+	return $basename, undef;
+}
 	
-	read_incremental
-		$ANOMALYLOGDIR,
-		"capture_anomalylog",
-		qr"^anomalylog\..*$",
-		sub {
-			my ($anomalylogfile, $diff) = @_;
-			my ($basename) = $anomalylogfile =~ m"^anomalylog\.(.*)";
-			my $matched;
-			foreach my $m ( @{ $conf->{anomalymonitor} } ){
-				my $regexp = $m->{outputlogregexp};
-				my $fixed = $m->{tagfixed};
-				my $pattern = $m->{pattern};
-				next unless $basename =~ $regexp;
-				next unless defined $pattern;
-
-				my $outputfile = "$CAPTUREDLOGDIR/capturedlog.$pattern";
-				my $patternfile = "$PATTERNSDIR/$pattern.pattern";
-				my $rulefile = "$PATTERNSDIR/$pattern.rules";
-
-				my $cmd;
-				$cmd .= "$BINDIR/panopticfilter filter -p $patternfile -e 's///' |";
-				$cmd .= " grep ANOMALY |";
-				$cmd .= " $BINDIR/panopticfilter json2text |";
-				$cmd .= " $BINDIR/panopticfilter strip -r $rulefile";
-				$cmd .= " -p $patternfile" if -f $patternfile;
-				$cmd .= " >> $outputfile";
-				open my $h, "|-", $cmd or do {
-					die "command \"$cmd\", stopped";
-				};
-				print $h $diff;
-				close $h;
-				unlink $outputfile unless -s $outputfile;
-				$matched = 1;
-				last;
-			}
-			print "$anomalylogfile: not matched.\n" unless $matched;
-		};
-
-	exit 0;
-}
-
-sub subcmd_capture_unmonitoredlog ($) {
-	my ($conf) = @_;
-
-	my $cmd;
-	foreach my $m ( @{ $conf->{anomalymonitor} } ){
-		my $pattern = $m->{pattern};
-		next unless defined $pattern;
-		next if -f "$PATTERNSDIR/$pattern.pattern";
-
-		$cmd .= "cp $CONFDIR/rules.template $PATTERNSDIR/$pattern.rules ; "
-			unless -f "$PATTERNSDIR/$pattern.rules";
-	}
-	system $cmd if $cmd;
-
-	read_incremental
-		$UNMONITOREDLOGDIR,
-		"capture_unmonitoredlog",
-		qr"^unmonitoredlog\..*$",
-		sub {
-			my ($unmonitoredlogfile, $diff) = @_;
-			my ($basename) = $unmonitoredlogfile =~ m"^unmonitoredlog\.(.*)";
-			foreach my $m ( @{ $conf->{anomalymonitor} } ){
-				#my $regexp = $m->{outputlogregexp};
-				my $regexp = $m->{inputlogregexp};
-				my $fixed = $m->{tagfixed};
-				my $pattern = $m->{pattern};
-				next unless $basename =~ $regexp;
-				next unless defined $pattern;
-
-				my $outputfile = "$CAPTUREDLOGDIR/capturedlog.$pattern";
-				my $patternfile = "$PATTERNSDIR/$pattern.pattern";
-				my $rulefile = "$PATTERNSDIR/$pattern.rules";
-
-				my $cmd;
-				$cmd .= "$BINDIR/panopticfilter strip -r $rulefile";
-				$cmd .= " -p $patternfile" if -f $patternfile;
-				$cmd .= " >> $outputfile";
-				open my $h, "|-", $cmd or do {
-					die;
-				};
-				print $h $diff;
-				close $h;
-				unlink $outputfile unless -s $outputfile;
-				last;
-			}
-		};
-	exit 0;
-}
-
-sub subcmd_import_capturedlog ($) {
-	my ($conf) = @_;
-	opendir my $d, $CAPTUREDLOGDIR or do {
-		die "$CAPTUREDLOGDIR: cannot open. stopped";
-	};
-	my @capturedlog;
-	while( my $e = readdir $d ){
-		next if $e =~ m"^\.";
-		next unless $e =~ m"^capturedlog\.(.*)$";
-		push @capturedlog, $1;
-	}
-	close $d;
-	foreach my $pattern ( @capturedlog ){
-		next unless -f "$PATTERNSDIR/$pattern.rules";
-		my $cmd;
-		$cmd .= "cat $CAPTUREDLOGDIR/capturedlog.$pattern";
-		$cmd .= " >> $PATTERNSDIR/$pattern.sample";
-		$cmd .= " && rm $CAPTUREDLOGDIR/capturedlog.$pattern";
-		system $cmd;
-	}
-	exit 0;
-}
-
-sub subcmd_show_capturedlog ($) {
-	my ($conf) = @_;
-	opendir my $d, $CAPTUREDLOGDIR or do {
-		die "$CAPTUREDLOGDIR: cannot open. stopped";
-	};
-	my @capturedlog;
-	while( my $e = readdir $d ){
-		next if $e =~ m"^\.";
-		next unless $e =~ m"^capturedlog\.(.*)$";
-		push @capturedlog, $1;
-	}
-	close $d;
-	foreach my $pattern ( sort @capturedlog ){
-		next unless -s "$CAPTUREDLOGDIR/capturedlog.$pattern";
-		print "==== $pattern ====\n";
-		system "cat $CAPTUREDLOGDIR/capturedlog.$pattern";
-		print "\n";
-	}
-	exit 0;
-}
-
 sub subcmd_list_unmonitoredlog ($) {
 	my ($conf) = @_;
 	
 	opendir my $d, $UNMONITOREDLOGDIR or do {
 		die "$UNMONITOREDLOGDIR: cannot open. stopped";
 	};
+	my %unmonitoredlogs;
 	my @unmonitoredlogs;
 	while( my $e = readdir $d ){
 		next if $e =~ m"^\.";
-		next unless $e =~ m"^unmonitoredlog\.(.*)$";
-		push @unmonitoredlogs, $1; 
+		my ($basename, $monitorname) = _unmonitoredlog2monitor $conf, $e;
+		next if $unmonitoredlogs{$basename};
+		$unmonitoredlogs{$basename} = 1;
+		push @unmonitoredlogs, [$basename, $monitorname];
 	}
 	close $d;
 
-	foreach my $unmonitoredlog ( sort @unmonitoredlogs ){
-		my $planned;
-		foreach my $m ( @{ $conf->{anomalymonitor} } ){
-			my $regexp = $m->{inputlogregexp};
-			next unless $unmonitoredlog =~ $regexp;
-			$planned = 1;
-			last;
+	foreach my $unmonitoredlog ( sort {$$a[0] cmp $$b[0]} @unmonitoredlogs ){
+		my $basename    = $$unmonitoredlog[0];
+		my $monitorname = $$unmonitoredlog[1];
+
+		print "$basename\n";
+		if( $monitorname ){
+			my $samples = "$WELLKNOWNSDIR/$monitorname.samples";
+			if( -f $samples ){
+				print "	(will monitored by $monitorname, has samples)\n";
+			}else{
+				print "	(will monitored by $monitorname, no sample)\n";
+			}
 		}
-
-		if( $planned ){
-			print "$unmonitoredlog (planned)\n";
-		}else{
-			print "$unmonitoredlog\n";
-		}
 	}
 	exit 0;
 }
 
-sub subcmd_strip_capturedlog ($) {
-	my ($conf) = @_;
-	opendir my $d, $CAPTUREDLOGDIR or do {
-		die "$CAPTUREDLOGDIR: cannot open. stopped";
+sub _import_unmonitoredlog ($$) {
+	my ($monitor, $samples) = @_;
+	my $samplesfile = "$WELLKNOWNSDIR/$monitor.samples";
+	my $regexpfile  = "$WELLKNOWNSDIR/$monitor.regexp";
+	my $rulesfile   = "$WELLKNOWNSDIR/$monitor.rules";
+
+	my $cmd;
+	$cmd .= "cp $CONFDIR/rules.template $rulesfile ; " unless -f $rulesfile;
+	$cmd .= "$BINDIR/panopticfilter strip -r $rulesfile";
+	$cmd .= " -p $regexpfile" if -f $regexpfile;
+	$cmd .= " >> $samplesfile";
+	open my $h, "|-", $cmd or do {
+		die;
 	};
-	my @capturedlog;
-	while( my $e = readdir $d ){
-		next if $e =~ m"^\.";
-		next unless $e =~ m"^capturedlog\.(.*)$";
-		push @capturedlog, $1;
-	}
-	close $d;
-	foreach my $pattern ( sort @capturedlog ){
-		next unless -s "$CAPTUREDLOGDIR/capturedlog.$pattern";
-		my $cmd;
-		$cmd .= "$BINDIR/panopticfilter strip -r $PATTERNSDIR/$pattern.rules";
-		$cmd .= " -p $PATTERNSDIR/$pattern.pattern" if -f "$PATTERNSDIR/$pattern.pattern";
-		$cmd .= " < $CAPTUREDLOGDIR/capturedlog.$pattern";
-		$cmd .= " > $CAPTUREDLOGDIR/stripedlog.$pattern ; ";
-		$cmd .= "mv $CAPTUREDLOGDIR/stripedlog.$pattern";
-		$cmd .= " $CAPTUREDLOGDIR/capturedlog.$pattern";
-		system $cmd;
-		unlink "$CAPTUREDLOGDIR/capturedlog.$pattern" unless -s "$CAPTUREDLOGDIR/capturedlog.$pattern";
-	}
+	print $h $samples;
+	close $h;
+	unlink $samplesfile unless -s $samplesfile;
+}
+
+sub subcmd_import_unmonitoredlog ($) {
+	my ($conf) = @_;
+
+	read_incremental
+		$UNMONITOREDLOGDIR,
+		"import_unmonitoredlog",
+		qr"^unmonitoredlog\..*$",
+		sub {
+			my ($unmonitoredlog, $samples) = @_;
+			my ($basename, $monitor) = _unmonitoredlog2monitor
+				$conf, $unmonitoredlog;
+			return undef unless defined $monitor;
+			return _import_unmonitoredlog $monitor, $samples;
+		};
 	exit 0;
 }
 
-sub subcmd_whydonthit_capturedlog ($) {
-	my ($conf) = @_;
-	opendir my $d, $CAPTUREDLOGDIR or do {
-		die "$CAPTUREDLOGDIR: cannot open. stopped";
-	};
-	my @capturedlog;
-	while( my $e = readdir $d ){
-		next if $e =~ m"^\.";
-		next unless $e =~ m"^capturedlog\.(.*)$";
-		push @capturedlog, $1;
-	}
-	close $d;
-	foreach my $pattern ( sort @capturedlog ){
-		next unless -s "$CAPTUREDLOGDIR/capturedlog.$pattern";
-		my $cmd;
-		$cmd .= "$BINDIR/panopticfilter whydonthit";
-		$cmd .= " -r $PATTERNSDIR/$pattern.rules";
-		$cmd .= " -f $PATTERNSDIR/$pattern.sample";
-		$cmd .= " < $CAPTUREDLOGDIR/capturedlog.$pattern |";
-		$cmd .= "jq .";
-		system $cmd;
-	}
-	exit 0;
-}
-
-sub subcmd_strip_sample ($) {
-	my ($conf) = @_;
-	opendir my $d, $PATTERNSDIR or do {
-		die "$PATTERNSDIR: cannot open. stopped";
+sub subcmd_strip_wellknown_samples () {
+	opendir my $d, $WELLKNOWNSDIR or do {
+		die "$WELLKNOWNSDIR: cannot open. stopped";
 	};
 	my @samples;
 	while( my $e = readdir $d ){
 		next if $e =~ m"^\.";
-		next unless -s "$PATTERNSDIR/$e";
-		next unless $e =~ m"^([-\w]+)(\+[-\w]+)?\.sample$";
-		next unless -f "$PATTERNSDIR/$1.rules";
+		next unless -s "$WELLKNOWNSDIR/$e";
+		next unless $e =~ m"^([-\w]+)(\+[-\w]+)?\.samples$";
+		next unless -f "$WELLKNOWNSDIR/$1.rules";
 		push @samples, {rules => $1, name => "$1$2"};
 	}
 	close $d;
@@ -483,12 +828,189 @@ sub subcmd_strip_sample ($) {
 		my $name = $sample->{name};
 		my $rules = $sample->{rules};
 		my $cmd;
-		$cmd .= "$BINDIR/panopticfilter strip -r $PATTERNSDIR/$rules.rules";
-		$cmd .= " < $PATTERNSDIR/$name.sample";
-		$cmd .= " > $PATTERNSDIR/$name.sample.new ; ";
-		$cmd .= "mv $PATTERNSDIR/$name.sample.new";
-		$cmd .= " $PATTERNSDIR/$name.sample";
+		$cmd .= "$BINDIR/panopticfilter strip -r $WELLKNOWNSDIR/$rules.rules";
+		$cmd .= " < $WELLKNOWNSDIR/$name.samples";
+		$cmd .= " > $WELLKNOWNSDIR/$name.samples.new ; ";
+		$cmd .= "mv $WELLKNOWNSDIR/$name.samples.new";
+		$cmd .= " $WELLKNOWNSDIR/$name.samples";
 		system $cmd;
+	}
+	exit 0;
+}
+
+sub _parse_detectedanomaly ($) {
+	my ($samples) = @_;
+	my $decoder = JSON::XS->new;
+	my %r;
+	foreach my $sample ( split m"\n", $samples ){
+		next if $sample =~ m"^\s*$";
+		utf8::decode($sample);
+		eval {
+			my $s = $decoder->decode( $sample );
+			my $pattern  = $$s{pattern};
+			my $message  = $$s{message};
+			my $unixtime = $$s{unixtime};
+			utf8::encode($message);
+		
+			push @{$r{$pattern}}, [$unixtime, $message];
+		};
+		if( $@ ){
+			print "error occured.\n";
+			print "\tjson:\t$sample\n";
+			print "\texception:\t$@\n";
+		}
+	}
+	return %r;
+}
+
+sub _write_detectedanomaly (%) {
+	my (%samples) = @_;
+	my $encoder = JSON::XS->new;
+
+	while( my ($pattern, $anomalies) = each %samples ){
+		my $statsfile   = "$GARAGEDIR/$pattern.stats";
+		my $rulefile    = "$WELLKNOWNSDIR/$pattern.rules";
+		my $patternfile = "$WELLKNOWNSDIR/$pattern.regexp";
+
+		print "DEBUG: $pattern: ", int(@$anomalies), "\n";
+
+		my $cmd;
+		unless( -f $statsfile ){
+			$cmd .= "cp /dev/null $statsfile ;";
+			print "$statsfile: created.\n";
+		}
+		unless( -f $rulefile ){
+			$cmd .= "cp $CONFDIR/rules.template $rulefile ;";
+			print "$rulefile: created.\n";
+		}
+
+		$cmd .= "$BINDIR/panopticfilter analyze";
+		$cmd .= " -r $rulefile";
+		$cmd .= " -s $statsfile";
+		$cmd .= " -p $patternfile" if -f $patternfile;
+		open my $h, "|-", $cmd or do {
+			die "command \"$cmd\", stopped";
+		};
+		foreach my $anomaly ( @$anomalies ){
+			my ($unixtime, $message) = @$anomaly;
+			utf8::decode($message);
+			my $json = $encoder->encode( {
+				unixtime => $unixtime,
+				message => $message,
+			} );
+			utf8::encode($json);
+			print $h "$json\n";
+		}
+		close $h;
+	}
+}
+
+sub subcmd_drop_into_garage () {
+	read_incremental
+		$DETECTDIR,
+		"drop_detectedanomaly_into_garage",
+		qr"^anomaly\.(\d{4}-\d{2}-\d{2})$",
+		sub {
+			my ($detectedanomalyfile, $samples) = @_;
+			print "reading $detectedanomalyfile ...\n";
+			my %samples = _parse_detectedanomaly $samples;
+			_write_detectedanomaly %samples;
+		};
+	exit 0;
+}
+
+sub _tidy_up_garage ($) {
+	my ($pattern) = @_;
+	unless( -s "$GARAGEDIR/$pattern.stats" ){
+		unlink "$GARAGEDIR/$pattern.stats";
+		return;
+	}
+
+	my $cmd;
+	$cmd .= "$BINDIR/panopticfilter reanalyze";
+	$cmd .= " -r $WELLKNOWNSDIR/$pattern.rules";
+	$cmd .= " -s $GARAGEDIR/$pattern.stats";
+	system $cmd;
+}
+
+sub subcmd_tidy_up_garage () {
+	my @stats = get_garage_index;
+	foreach my $i ( @stats ){
+		_tidy_up_garage $i;
+	}
+	exit 0;
+}
+
+sub subcmd_clean_up_catalogue () {
+	my @samples = get_catalogue_index;
+	foreach my $i ( @samples ){
+		unlink "$CATALOGUEDIR/$i.samples";
+	}
+	exit 0;
+}
+
+sub subcmd_export_catalogue ($\@\@) {
+	my ($include_wellknowns, $patterns, $conds) = @_;
+	my @stats = get_garage_index;
+	OUTSIDE:
+	foreach my $i ( @stats ){
+		foreach my $pattern ( @$patterns ){
+			my ($c, $regexp) = @$pattern;
+			if    ( $c eq 'match' ){
+				next OUTSIDE unless $i =~ m"^$regexp$";
+			}elsif( $c eq 'unmatch' ){
+				next OUTSIDE if $i =~ m"^$regexp$";
+			}
+		}
+		my $statsfile     = "$GARAGEDIR/$i.stats";
+		my $regexpfile    = "$WELLKNOWNSDIR/$i.regexp";
+		my $cataloguefile = "$CATALOGUEDIR/$i.samples";
+		my @conds = @$conds;
+		my $cmd;
+		$cmd .= "$BINDIR/panopticfilter export";
+		$cmd .= " -p $regexpfile" unless $include_wellknowns;
+		$cmd .= " -s $statsfile";
+		$cmd .= " @conds";
+		$cmd .= " > $cataloguefile";
+		system $cmd;
+		unlink $cataloguefile unless -s $cataloguefile;
+	}
+	exit 0;
+}
+
+sub subcmd_import_catalogue () {
+	my %c;
+	while( <STDIN> ){
+		chomp;
+		next unless m"^([-\w]+)\t(.*)$";
+		my $pattern = $1;
+		my $sample = $2;
+		$c{$pattern} .= "$sample\n";
+	}
+
+	while( my ($pattern, $samples) = each %c ){
+		open my $h, ">>", "$WELLKNOWNSDIR/$pattern.samples" or die;
+		print $h $samples;
+		close $h;
+	}
+	exit 0;
+}
+
+sub subcmd_filter_catalogue (@) {
+	my ($limit) = @_;
+	my $pass = undef;
+	while( <STDIN> ){
+		chomp;
+		if( m"^# (.*)$" ){
+			$pass = undef;
+			foreach my $param ( split m"\s+", $1 ){
+				die unless $param =~ m"^(\w+)=(.*)$";
+				$pass = 1 if $1 eq "count" and $2 > $limit;
+			}
+			print "$_\n" if $pass;
+		}elsif($pass){
+			print "$_\n";
+		}
 	}
 	exit 0;
 }
@@ -501,25 +1023,25 @@ sub get_mtime ($) {
 }
 
 sub subcmd_build_patterns () {
-	opendir my $d, $PATTERNSDIR or do {
-		die "$PATTERNSDIR: cannot open, stopped";
+	opendir my $d, $WELLKNOWNSDIR or do {
+		die "$WELLKNOWNSDIR: cannot open, stopped";
 	};
 	my %mtime;
 	my %option;
 	while( my $e = readdir $d ){
 		next if $e =~ m"^\.";
-		if    ( $e =~ m"^([-\w]+)\.pattern$" ){
-			my $mtime = get_mtime "$PATTERNSDIR/$e";
+		if    ( $e =~ m"^([-\w]+)\.regexp$" ){
+			my $mtime = get_mtime "$WELLKNOWNSDIR/$e";
 			next unless $mtime > 0;
 			$mtime{$1}->{pattern} = $mtime;
 		}elsif( $e =~ m"^([-\w]+)\.rules$" ){
-			my $mtime = get_mtime "$PATTERNSDIR/$e";
+			my $mtime = get_mtime "$WELLKNOWNSDIR/$e";
 			next unless $mtime > 0;
 			$mtime{$1}->{src} = $mtime if
 				not defined($mtime{$1}->{src}) or
 				$mtime > $mtime{$1}->{src};
-		}elsif( $e =~ m"^([-\w]+)(?:\+([-\w]+))?\.sample$" ){
-			my $mtime = get_mtime "$PATTERNSDIR/$e";
+		}elsif( $e =~ m"^([-\w]+)(?:\+([-\w]+))?\.samples$" ){
+			my $mtime = get_mtime "$WELLKNOWNSDIR/$e";
 			next unless $mtime > 0;
 			$mtime{$1}->{src} = $mtime if
 				not defined($mtime{$1}->{src}) or
@@ -530,59 +1052,52 @@ sub subcmd_build_patterns () {
 	close $d;
 
 	while( my ($k, $v) = each %mtime ){
-		print "$PATTERNSDIR/$k.sample: not found.\n" unless
-			-f "$PATTERNSDIR/$k.sample";
-		print "$PATTERNSDIR/$k.rules: not found.\n" unless
-			-f "$PATTERNSDIR/$k.rules";
-		next unless -f "$PATTERNSDIR/$k.sample" and -f "$PATTERNSDIR/$k.rules";
-		next if -f "$PATTERNSDIR/$k.pattern" and $v->{src} < $v->{pattern};
-		my $command = "$BINDIR/panopticfilter build";
-		$command .= " -r $PATTERNSDIR/$k.rules -d $PATTERNSDIR/$k.diagnosis";
-		$command .= " -o $PATTERNSDIR/$k.pattern -f $PATTERNSDIR/$k.sample";
+		my $samplefile	  = "$WELLKNOWNSDIR/$k.samples";
+		my $rulefile	  = "$WELLKNOWNSDIR/$k.rules";
+		my $regexpfile	  = "$WELLKNOWNSDIR/$k.regexp";
+		my $diagnosisfile = "$WELLKNOWNSDIR/$k.diagnosis";
+		
+		my $cmd;
+		unless( -f $samplefile ){
+                        $cmd .= "cp /dev/null $samplefile ;";
+                        print "$samplefile: created.\n";
+                }
+		unless( -f $rulefile ){
+                        $cmd .= "cp $CONFDIR/rules.template $rulefile ;";
+                        print "$rulefile: created.\n";
+                }
+		next if -f $regexpfile and $$v{src} < $$v{pattern};
+		$cmd .= "$BINDIR/panopticfilter build";
+		$cmd .= " -r $rulefile -d $diagnosisfile";
+		$cmd .= " -o $regexpfile -f $samplefile";
 		foreach my $i ( @{$option{$k} // []} ){
-			$command .= " -e $i -f $PATTERNSDIR/$k+$i.sample";
+			$cmd .= " -e $i -f $WELLKNOWNSDIR/$k+$i.samples";
 		}
-		system "$command\n";
+		system "$cmd\n";
 	}
 
 	exit 0;
 }
 
+
 ####
-my $conf = read_fluentd_conf;
-if    ($ARGV[0] eq 'build_fluentd_conf'){
-	subcmd_build_fluentd_conf $conf;
-}elsif($ARGV[0] eq 'build_patterns'){
+my $cmd = shift @ARGV;
+if    ($cmd eq 'test_confs'){
+	subcmd_test_confs;
+
+}elsif($cmd eq 'build_patterns'){
 	subcmd_build_patterns;
-}elsif($ARGV[0] eq 'capture_anomalylog'){
-	subcmd_capture_anomalylog $conf;
-}elsif($ARGV[0] eq 'capture_unmonitoredlog'){
-	subcmd_capture_unmonitoredlog $conf;
-}elsif($ARGV[0] eq 'show_capturedlog'){
-	subcmd_show_capturedlog $conf;
-}elsif($ARGV[0] eq 'strip_capturedlog'){
-	subcmd_strip_capturedlog $conf;
-}elsif($ARGV[0] eq 'whydonthit_capturedlog'){
-	subcmd_whydonthit_capturedlog $conf;
-}elsif($ARGV[0] eq 'import_capturedlog'){
-	subcmd_import_capturedlog $conf;
-}elsif($ARGV[0] eq 'list_unmonitoredlog'){
-	subcmd_list_unmonitoredlog $conf;
-}elsif($ARGV[0] eq 'strip_sample'){
-	subcmd_strip_sample $conf;
+
+}elsif($cmd eq 'strip_wellknown_samples'){
+	subcmd_strip_wellknown_samples;
+
 }else{
 	print	"usage: % $0 <SUBCOMMAND>\n",
 		"\n",
 		"    SUBCOMMAND\n",
-		"         build_fluentd_conf\n",
+		"         test_confs\n",
 		"         build_patterns\n",
-		"         capture_anomalylog\n",
-		"         capture_unmonitoredlog\n",
-		"         show_capturedlog\n",
-		"         strip_capturedlog\n",
-		"         import_capturedlog\n",
-		"         list_unmonitoredlog\n",
-		"         strip_sample\n",
+		"         strip_wellknown_sample\n",
 		"\n";
 	exit 1;
 }

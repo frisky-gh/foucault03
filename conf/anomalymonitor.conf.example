@@ -1,0 +1,49 @@
+
+anomalymonitor_rule
+	target	log\.fluent\..*
+	pattern	fluent
+
+anomalymonitor_rule
+	target	log\.syslog\..*
+	pattern	syslog
+
+anomalymonitor_rule
+	target	log\.apache\.(?<TAG>.*access*..*)
+	pattern	apache_access
+	redirect	10ACCESS
+		tag	log.apache_ipaddr.<TAG>
+		message	<IPADDR>
+	redirect	10ACCESS
+		tag	log.apache_path.<TAG>
+		message	<METHOD> <PATH>
+	redirect	10ACCESS
+		tag	log.apache_querystring.<TAG>
+		message	<QUERYSTRING>
+	redirect	10ACCESS
+		tag	log.apache_useragent.<TAG>
+		message	<USERAGENT>
+	redirect	10ACCESS
+		tag	log.apache_referer.<TAG>
+		message	<REFERER>
+
+anomalymonitor_rule
+	target	log\.apache_ipaddr\..*
+	pattern	apache_ipaddr
+anomalymonitor_rule
+	target	log\.apache_path\..*
+	pattern	apache_path
+anomalymonitor_rule
+	target	log\.apache_querystring\..*
+	pattern	apache_querystring
+anomalymonitor_rule
+	target	log\.apache_useragent\..*
+	pattern	apache_useragent
+anomalymonitor_rule
+	target	log\.apache_referer\..*
+	pattern	apache_referer
+
+anomalymonitor_rule
+	target	log\.apache\..*error.*
+	pattern	apache_error
+
+

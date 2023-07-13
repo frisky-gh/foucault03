@@ -1,9 +1,0 @@
-#### category definition
-category mppf_flash
-	tagmatch	syslog\..*
-	eventmatch	ANOMALY
-	type		flash
-	receiver	frisky-gh@example.com
-	mininterval	60
-
-

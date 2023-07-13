@@ -1,0 +1,46 @@
+MAILFROM=fccl-sdd-mppf-ope@mcdev.fmworld.net
+
+#### attribute definition
+define_attribute
+	captures_from_tag	log\.(?<CATEGORY>\w+)\.(?<SUBCATEGORY>\w+)\.(?<HOSTNAME>[-\w]+).*
+#	if_tag_matches		log\.\w+\.(w+)\..*
+#		rule_sets_attribute	HOGE
+
+#### alert definition
+
+define_alert Common_WebAccess
+	captures_anomalylogs
+		matching_monitorname	(apache_.*|jetty_request_log)
+		matching_event		ANOMALY
+
+	marks_logs_as	MONITORED
+
+define_alert Common_Crit
+	captures_anomalylogs
+		tagged_as	log\.batch\..*
+		not_marked_as	MONITORED
+
+	captures_trafficlogs
+		named_as	.*
+		not_marked_as	MONITORED
+
+	marks_logs_as	MONITORED
+
+define_alert Common_Anomaly
+	captures_anomalylogs
+		tagged_as	.*
+		matching_event	ANOMALY
+		not_marked_as	MONITORED
+	marks_logs_as	MONITORED
+
+define_alert Common_Unmonitored
+	captures_anomalylogs
+		tagged_as	.*
+		not_marked_as	MONITORED
+
+	captures_trafficlogs
+		named_as	.*
+		passing_through	.*
+		not_marked_as	MONITORED
+
+
