@@ -25,1383 +25,137 @@ use Template;
 use JSON::XS;
 use Data::Dumper;
 use Time::Local 'timelocal';
+use POSIX setsid;
 use strict;
 
-our $NAME = 'foucaultd';
-our $FOUCAULT03D_CONFFILE       = "$CONFDIR/foucault03d.conf";
-our $CONCATFILTER_CONFFILE      = "$CONFDIR/concatfilter.conf";
-our $ANOMALYMONITOR_CONFFILE    = "$CONFDIR/anomalymonitor.conf";
-our $TRANSACTIONFILTER_CONFFILE = "$CONFDIR/transactionfilter.conf";
-our $TRAFFICMONITOR_CONFFILE    = "$CONFDIR/trafficmonitor.conf";
+use Foucault::Runtime;
 
-####
-our $CURR_LOGFILE;
-our $CURR_LOGFH = *STDERR;
-our $JSONENCODER = JSON::XS->new;
-our $TRACE;
-our $INFO;
-our $DEBUG;
-our $PIDFILE;
-our $REGMARK;
+our $NAME = 'foucaultd_new';
 
-our $TRAFFICDIR;
-our $WELLKNOWNDIR;
-our $CONCATDIR;
-
+our $RUNTIME  = Foucault::Runtime->new( $TOOLHOME );
 our $TOTALLOG = 0;
+our $PING_RENEWAL_SEC = 3600;
+our $PONG_EXPIRATION_SEC = 300;
 
-#### string functions
+#### child daemon functions
 
-sub expand_path ($) {
-	my ($t) = @_;
-	my ($sec, $min, $hour, $day, $mon, $year) = localtime;
-	$t =~ s{(%[ymdHMS]|\~)}{
-		if   ( $1 eq '%y' ){ sprintf "%04d", $year+1900; }
-		elsif( $1 eq '%m' ){ sprintf "%02d", $mon+1; }
-		elsif( $1 eq '%d' ){ sprintf "%02d", $day; }
-		elsif( $1 eq '%H' ){ sprintf "%02d", $hour; }
-		elsif( $1 eq '%M' ){ sprintf "%02d", $min; }
-		elsif( $1 eq '%S' ){ sprintf "%02d", $sec; }
-		elsif( $1 eq '~' ) { $ENV{HOME}; }
-	}eg;
-	return $t;
+## asynchronus signal functions
+
+sub process_periodic_as_child () {
+	$RUNTIME->refresh_loggers;
+	$RUNTIME->keep_filter;
+	monitor_content( "" );
+
+	my $timespan2added = {};
+	my $timespan2removed = {};
+	my $events = [];
+	my $changes = [];
+	$RUNTIME->keep_traffics   ($timespan2added, $timespan2removed);
+	$RUNTIME->monitor_traffics($timespan2added, $timespan2removed, $events);
+	$RUNTIME->update_trafficstatus( $events, $changes );
+	$RUNTIME->write_traffic_changes( $changes );
+	$RUNTIME->save_status;
 }
 
-sub expand_tag ($\%) {
-	my ($t, $captures) = @_;
-	$t =~ s{(?:<(\w+)>)}{
-		$$captures{$1};
-	}eg;
-	return $t;
+sub unset_child_child_handler () {
+	$SIG{'CHLD'} = 'IGNORE';
 }
 
-sub unixtime2timestring ($) {
-	my ($sec, $min, $hour, $day, $mon, $year) = localtime shift;
-	return sprintf "%04d-%02d-%02d_%02d:%02d",
-		$year+1900, $mon+1, $day, $hour, $min;
-}
-
-sub timestring2unixtime ($) {
-	my ($timestring) = @_;
-	return undef unless $timestring =~ m"^(\d{4})-(\d{2})-(\d{2})_(\d{2}):(\d{2})$";
-	return timelocal 0, $5, $4, $3, $2-1, $1-1900;
-}
-
-sub var2ltsv ( \% ){
-	my ($var) = @_;
-	my @ltsv;
-	push @ltsv, "host_service:".$var->{host_service} if defined $var->{host_service};
-	foreach my $k ( sort {$a cmp $b} keys %$var ){
-		next if $k eq 'host_service';
-		push @ltsv, "$k:".$var->{$k};
-	}
-	return join "\t", @ltsv;
-}
-
-sub ltsv2var ( $ ){
-	my ($ltsv) = @_;
-	my %var;
-	foreach my $kv ( split m"\t", $ltsv ){
-		$kv =~ m"^([-./\[\]\w]+):(.*)$" or do {
-			next;
-		};
-		my $k = $1;
-		my $v = $2;
-		$var{$k} = $v;
-	}
-	return %var;
-}
-
-sub compile_subnet ($) {
-	my $subnet = shift;
-	if( $subnet =~ m"^(\d+\.\d+\.\d+\.\d+)/(\d+)$" ){
-		my $addr = $1;
-		my $netbit = $2;
-		my $bin_netmask = inet_aton '255.255.255.255';
-		for( my $i = $netbit; $i < 32; ++$i ){ 
-			vec($bin_netmask, $i, 1) = 0;
-		}
-		my $bin_addr = inet_aton $addr;
-		my $bin_subnet = $bin_addr & $bin_netmask;
-		return [$bin_addr, $bin_netmask];
-	}elsif( $subnet =~ m"^(\d+\.\d+\.\d+\.\d+)$" ){
-		my $bin_netmask = inet_aton '255.255.255.255';
-		my $bin_addr = inet_aton $subnet;
-		return [$bin_addr, $bin_netmask];
-	}
-	return undef;
-}
-
-sub compile_subnet_list ($) {
-	my ($subnet_list) = @_;
-	my @r;
-	foreach my $subnet ( split m",", $subnet_list ){
-		push @r, compile_subnet $subnet;
-	}
-	return @r;
-}
-
-sub check_subnet_list ($\@) {
-	my ($bin_addr, $allow_subnets) = @_;
-	foreach my $subnet_netmask ( @$allow_subnets ){
-		if( $$subnet_netmask[0] eq ($bin_addr & $$subnet_netmask[1]) ){
-			return 1;
-		}
-	}
-	return undef;
-}
-
-#### logging functions
-
-sub tracelog ($;@) {
-	return unless $TRACE;
-	my ($format, @args) = @_;
-	my ($sec,$min,$hour,$day,$mon,$year) = localtime time;
-	my $t = sprintf '%04d-%02d-%02d_%02d:%02d:%02d', $year+1900, $mon+1, $day, $hour, $min, $sec;
-	printf $CURR_LOGFH "$t [TRACE] $format\n", @args;
-}
-
-sub infolog ($;@) {
-	return unless $INFO;
-	my ($format, @args) = @_;
-	my ($sec,$min,$hour,$day,$mon,$year) = localtime time;
-	my $t = sprintf '%04d-%02d-%02d_%02d:%02d:%02d', $year+1900, $mon+1, $day, $hour, $min, $sec;
-	printf $CURR_LOGFH "$t [INFO] $format\n", @args;
-}
-
-sub errorlog ($;@) {
-	my ($format, @args) = @_;
-	my ($sec,$min,$hour,$day,$mon,$year) = localtime time;
-	my $t = sprintf '%04d-%02d-%02d_%02d:%02d:%02d', $year+1900, $mon+1, $day, $hour, $min, $sec;
-	printf $CURR_LOGFH "$t [ERROR] $format\n", @args;
-}
-
-sub accesslog ($;@) {
-	my ($format, @args) = @_;
-	my ($sec,$min,$hour,$day,$mon,$year) = localtime time;
-	my $t = sprintf '%04d-%02d-%02d_%02d:%02d:%02d', $year+1900, $mon+1, $day, $hour, $min, $sec;
-	printf $CURR_LOGFH "$t [ACCESS] $format\n", @args;
-}
-
-####
-
-#sub setup_workdir () {
-#	if( $ENV{'HOME'} ){ $STATUSDIR = $ENV{'HOME'} . "/.ncrt"; }
-#	else{
-#		my ($name, $pw, $uid, $gid, $quota, $comment, $gcos,
-#		    $home, $shell, $expire ) = getpwuid $<;
-#		$WORKDIR = "$home/.ncrt";
-#	}
-#	unless( -d $WORKDIR ){
-#		mkdir $WORKDIR or die "$WORKDIR: cannot create, stopped";
-# 	}
-#}
-
-sub read_command ($) {
-	my ($cmd) = @_;
-
-	#my $out, my $in;
-	my $pid = open2 my $out, my $in, $cmd;
-	close $in;
-
-	my @messages;
-	my %metrics;
-	while( <$out> ){
-		chomp;
-		next if m"^\s*(#|$)";
-		die "$_, stopped" unless m"^([-\w/\[\].:@\$%#\*]+)=(.*)$";
-		my $k = $1;
-		my $v = $2;
-		if( $k eq 'message' ){ push @messages, $v; }
-		elsif( $v =~ m"^([-+]?\d+(?:\.\d+)?)([%a-zA-Z]*)$" ){
-			$metrics{$k} = $v;
-		}
-	}
-	close $out;
-
-	waitpid $pid, 0;
-	my $plugin_rc = $? >> 8;
-	my $ok = 1;
-	if( $plugin_rc > 0 ){
-		push @messages, "plugin_rc:$plugin_rc";
-		$ok = undef;
-	}
-	return $ok, \%metrics, \@messages;
-}
-
-sub read_regexpfile ($) {
-	my ( $f ) = @_;
-	open my $h, '<', $f or do {
-		infolog "read_regexpfile: $f: cannot read.";
-		return undef, undef;
-	};
-	my ($dev, $ino, $mode, $nlink, $uid, $gid, $rdev, $size,
-	    $atime, $mtime, $ctime, $blksize, $blocks) = stat $h;
-	my $regexp = join '', <$h>;
-	chomp $regexp;
-	close $h;
-	my $regexp_compiled;
-	eval {
-		$regexp_compiled = qr"^$regexp$";
-	};
-	unless( defined $regexp_compiled ){
-		infolog "read_regexpfile: $f: cannot compile.";
-		return undef, undef;
-	}
-	return $regexp_compiled, $mtime;
-}
-
-#### file I/O functions
-
-# YYYY-MM-DD HH:MM:00 -----+-- traffic slice epoch
-# ...                      |
-# ...                      +-- traffic slice
-# ...                      |
-# YYYY-MM-DD HH:MM:59 -----+
-#
-# traffic slice [time01] --+
-# traffic slice [time02]   |
-# traffic slice [time03]   +- traffic timeline
-# ...                      |
-# traffic slice [timeNN] --+
-# 
-# traffic slice[time01]
-#  + traffic slice[time02]
-#  + ...
-#  + traffic slice[timeNN] = traffic total
-#
-#
-our @TRAFFIC_TIMELINE;
-our $LATEST_TRAFFIC_SLICEEPOCH;
-our $LATEST_TRAFFIC_SLICE;
-our $LATEST_TRAFFIC_ACTIVATETIME;
-
-# 一定時間ごとに切り替わるもの
-our $CURR_ANOMALY_DETECTFILE;
-our $CURR_ANOMALY_DETECTFH;
-our $CURR_TRAFFIC_DETECTFILE;
-our $CURR_TRAFFIC_DETECTFH;
-our $CURR_TIMESTAMP;
-
-# 設定リロード時に切り替わるもの
-our $RECENT_FOUCAULT03D_CONF;
-our $RECENT_ALLOWLIST;
-our $RECENT_CONCATFILTER_CONF;
-our $RECENT_ANOMALYMONITOR_CONF;
-our $RECENT_TRANSACTIONFILTER_CONF;
-our $RECENT_TRAFFICMONITOR_CONF;
-
-our $RECENT_CONCATFILTER_RULECACHE;
-our $RECENT_ANOMALYMONITOR_RULECACHE;
-our $RECENT_TRANSACTIONFILTER_RULECACHE;
-our $RECENT_TRAFFICMONITOR_RULECACHE;
-
-our $RECENT_ANOMALY_UNMONITOREDCACHE;
-our $RECENT_TRANSACTION_UNMONITOREDCACHE;
-our $RECENT_TRAFFIC_UNMONITOREDCACHE;
-
-# 設定リロード時に再作成
-our $RECENT_TRAFFIC_SUBTIMESPANS;
-
-# サブタイムライン再構築時に再作成
-our $RECENT_TRAFFIC_MONITORSTATUS;	# name, tag => monitorstatus
-our $RECENT_TRAFFIC_SUBTOTAL;		# timespan, tag => subtotal
-our $RECENT_TRAFFIC_SUBTIMELINE;
-
-sub read_foucault03d_conf () {
-	my $homedir = $ENV{HOME};
-	unless( defined $homedir ){
-		my ($name, $pw, $uid, $gid, $quota, $comment, $gcos,
-		    $home, $shell, $expire ) = getpwuid $<;
-		$homedir = $home;
-	}
-
-	my %conf = (
-		'listen_address' => '0.0.0.0',
-		'listen_port'	=> 46847,
-		'daemon_user'	=> '-',
-		'allow' 	=> "0.0.0.0/0",
-		'TRACE' 	=> 0,
-		'INFO'  	=> 0,
-		'DEBUG' 	=> 0,
-		'logfile'		=> "$LOGDIR/foucault03d.log.%y-%m-%d",
-		'anomalydetectfile'	=> "$LOGDIR/anomaly.%y-%m-%d",
-		'trafficdetectfile'	=> "$LOGDIR/traffic.%y-%m-%d",
-		'trafficdir'		=> "$LOGDIR",
-		'concatdir'		=> "$LOGDIR",
-		'pidfile'		=> "$RUNDIR/foucault03d.pid",
-		'wellknowndir'		=> "$CONFDIR",
-	);
-
-	open my $h, '<', $FOUCAULT03D_CONFFILE or do {
-		die "cannot open $FOUCAULT03D_CONFFILE: $OS_ERROR, stopped";
-	};
-	while (<$h>) {
-		next if m"^\s*(#|$)";
-		die "$FOUCAULT03D_CONFFILE:$.: illegal format, stopped" unless m"^(\w+)=(.*)$";
-		$conf{$1} = $2;
-	}
-	close $h or do {
-		die "close failed for $FOUCAULT03D_CONFFILE: $OS_ERROR, stopped";
-	};
-
-	$RECENT_FOUCAULT03D_CONF = \%conf;
-	$TRACE = $conf{TRACE};
-	$INFO  = $conf{INFO};
-	$DEBUG = $conf{DEBUG};
-}
-
-sub init_filepath () {
-	my $conf = $RECENT_FOUCAULT03D_CONF;
-	my $orig;
-
-	$PIDFILE   = expand_path $$conf{pidfile};
-	$WELLKNOWNDIR = expand_path $$conf{wellknowndir};
-	$TRAFFICDIR   = expand_path $$conf{trafficdir};
-	$CONCATDIR    = expand_path $$conf{concatdir};
-}
-
-sub update_filepath () {
-	my $conf = $RECENT_FOUCAULT03D_CONF;
-	my $orig;
-
-	$orig = $CURR_LOGFILE;
-	$CURR_LOGFILE = expand_path $$conf{logfile};
-	if( $orig ne $CURR_LOGFILE ){
-		$CURR_LOGFH = undef if $CURR_LOGFH eq *STDERR;
-		close $CURR_LOGFH if defined $CURR_LOGFH;
-		if( open $CURR_LOGFH,'>>',$CURR_LOGFILE ){
-			$CURR_LOGFH->autoflush;
-		}else{
-			errorlog "$CURR_LOGFILE: cannot open.";
-		}
-	}
-
-	$orig = $CURR_ANOMALY_DETECTFILE;
-	$CURR_ANOMALY_DETECTFILE = expand_path $$conf{anomalydetectfile};
-	if( $orig ne $CURR_ANOMALY_DETECTFILE ){
-		close $CURR_ANOMALY_DETECTFH if defined $CURR_ANOMALY_DETECTFH;
-		if( open $CURR_ANOMALY_DETECTFH,'>>',$CURR_ANOMALY_DETECTFILE ){
-			$CURR_ANOMALY_DETECTFH->autoflush;
-		}else{
-			errorlog "$CURR_ANOMALY_DETECTFILE: cannot open.";
-		}
-	}
-
-	$orig = $CURR_TRAFFIC_DETECTFILE;
-	$CURR_TRAFFIC_DETECTFILE = expand_path $$conf{trafficdetectfile};
-	if( $orig ne $CURR_ANOMALY_DETECTFILE ){
-		close $CURR_TRAFFIC_DETECTFH if defined $CURR_TRAFFIC_DETECTFH;
-		if( open $CURR_TRAFFIC_DETECTFH,'>>',$CURR_TRAFFIC_DETECTFILE ){
-			$CURR_ANOMALY_DETECTFH->autoflush;
-		}else{
-			errorlog "$CURR_TRAFFIC_DETECTFILE: cannot open.";
-		}
-	}
-}
-
-sub update_allowlist () {
-	my $conf = $RECENT_FOUCAULT03D_CONF;
-	$RECENT_ALLOWLIST = [ compile_subnet_list $$conf{allow} ];
-}
-
-sub read_concatfilter_conf () {
-	my @conf;
-	my $rule;
-	open my $h, '<', $CONCATFILTER_CONFFILE or do {
-		die "cannot open $CONCATFILTER_CONFFILE: $OS_ERROR, stopped";
-	};
-	while (<$h>) {
-		next if m"^\s*(#|$)";
-		if    ( m"^\s*concat_rule\s*$" ){
-			$rule = {
-				'name' => "$CONCATFILTER_CONFFILE:$.",
-				'type' => 'pattern-first',
-				'limit_line' => 100,
-				'limit_time' => 10*60,
-			};
-			push @conf, $rule;
-		}elsif( m"^\s*target\s+(\S.*)$" ){
-			push @{$$rule{targets}}, qr"^($1)$";
-		}elsif( m"^\s*pattern\s+(\S.*)$" ){
-			push @{$$rule{patterns}}, qr"^($1)$";
-		}elsif( m"^\s*type\s+(\S.*)$" ){
-			$$rule{type} = $1;
-		}else{
-			errorlog "$CONCATFILTER_CONFFILE:$.: illegal format, ignored.";
-		}
-	}
-	close $h or do {
-		die "close failed for $CONCATFILTER_CONFFILE: $OS_ERROR, stopped";
-	};
-	$RECENT_CONCATFILTER_CONF = \@conf;
-}
-
-sub read_anomalymonitor_conf () {
-	my $foucault03d_conf = $RECENT_FOUCAULT03D_CONF;
-	my @conf;
-	my $rule;
-	my $redirect;
-	open my $h, '<', $ANOMALYMONITOR_CONFFILE or do {
-		die "cannot open $ANOMALYMONITOR_CONFFILE: $OS_ERROR, stopped";
-	};
-	while (<$h>) {
-		next if m"^\s*(#|$)";
-		if    ( m"^\s*anomalymonitor_rule\s*$" ){
-			$rule = { 'name' => "$ANOMALYMONITOR_CONFFILE:$." };
-			push @conf, $rule;
-		}elsif( m"^\s*target\s+(\S.*)$" ){
-			my $re;
-			eval { $re = qr"^($1)$"; };
-			if( $@ ){ die "$ANOMALYMONITOR_CONFFILE:$.: $@, stopped"; }
-			push @{$$rule{targets}}, $re;
-		}elsif( m"^\s*pattern\s+(\S.*)$" ){
-			$$rule{pattern} = $1;
-			my $f = "$WELLKNOWNDIR/$1.regexp";
-			$$rule{pattern_file} = $f;
-			my ($regexp, $mtime) = read_regexpfile $f;
-			unless( defined $regexp ){
-				errorlog "$ANOMALYMONITOR_CONFFILE:$.:" .
-					"$f: cannot open.";
-				$$rule{pattern_mtime} = undef;
-				$$rule{pattern_regexp} = undef;
-				next;
-			}
-			$$rule{pattern_mtime} = $mtime;
-			$$rule{pattern_regexp} = $regexp;
-			infolog "read_anomalymonitor_conf: $f: loaded.";
-		}elsif( m"^\s*redirect\s+(\S.*)$" ){
-			$redirect = {
-				'name' => "$ANOMALYMONITOR_CONFFILE:$.",
-				'event' => $1,
-			};
-			push @{$$rule{redirects}}, $redirect;
-		}elsif( m"^\s*tag\s+(\S.*)$" ){
-			$$redirect{tag} = $1;
-		}elsif( m"^\s*message\s+(\S.*)$" ){
-			$$redirect{message} = $1;
-		}else{
-			errorlog "$ANOMALYMONITOR_CONFFILE:$.: illegal format, ignored.";
-		}
-	}
-	close $h or do {
-		die "close failed for $ANOMALYMONITOR_CONFFILE: $OS_ERROR, stopped";
-	};
-	$RECENT_ANOMALYMONITOR_CONF = \@conf;
-}
-
-sub update_anomalymonitor_conf () {
-	foreach my $rule ( @$RECENT_ANOMALYMONITOR_CONF ){
-		my $pattern        = $$rule{pattern};
-		my $pattern_file   = $$rule{pattern_file};
-		my $pattern_mtime  = $$rule{pattern_mtime};
-		my $pattern_regexp = $$rule{pattern_regexp};
-
-		my ($dev, $ino, $mode, $nlink, $uid, $gid,
-		    $rdev, $size, $atime, $mtime, $ctime,
-		    $blksize, $blocks) = stat $pattern_file;
-		next if defined $mtime && $mtime < $pattern_mtime;
-
-		my ($regexp, $mtime) = read_regexpfile $pattern_file;
-		unless( defined $regexp ){
-			errorlog "$pattern_file: cannot open.";
-			next;
-		}
-		$$rule{pattern_mtime} = $mtime;
-		$$rule{pattern_regexp} = $regexp;
-		infolog "update_anomalymonitor_conf: $pattern: loaded.";
-	}
-}
-
-sub read_transactionfilter_conf () {
-	my @conf;
-	my $rule;
-	open my $h, '<', $TRANSACTIONFILTER_CONFFILE or do {
-		die "cannot open $TRANSACTIONFILTER_CONFFILE: $OS_ERROR, stopped";
-	};
-	while (<$h>) {
-		next if m"^\s*(#|$)";
-		if    ( m"^\s*transaction_rule\s*$" ){
-			$rule = { 'name' => "$TRANSACTIONFILTER_CONFFILE:$." };
-			push @conf, $rule;
-		}elsif( m"^\s*input\s+(\S.*)$" ){
-			my $re;
-			eval { $re = qr"^($1)$"; };
-			if( $@ ){ die "$TRANSACTIONFILTER_CONFFILE:$.: $@, stopped"; }
-			push @{$$rule{inputs}}, $re;
-		}elsif( m"^\s*output\s+(\S.*)$" ){
-			$$rule{output} = $1;
-		}elsif( m"^\s*tag_pattern\s+(\S.*)$" ){
-			my $re;
-			eval { $re = qr"^($1)$"; };
-			if( $@ ){ die "$TRANSACTIONFILTER_CONFFILE:$.: $@, stopped"; }
-			push @{$$rule{tag_patterns}}, $re;
-		}elsif( m"^\s*message_pattern\s+(\S.*)$" ){
-			my $re;
-			eval { $re = qr"^($1)$"; };
-			if( $@ ){ die "$TRANSACTIONFILTER_CONFFILE:$.: $@, stopped"; }
-			push @{$$rule{message_patterns}}, $re;
-		}else{
-			errorlog "$TRANSACTIONFILTER_CONFFILE:$.: illegal format, ignored.";
-		}
-	}
-	close $h or do {
-		die "close failed for $TRANSACTIONFILTER_CONFFILE: $OS_ERROR, stopped";
-	};
-	$RECENT_TRANSACTIONFILTER_CONF = \@conf;
-}
-
-sub read_trafficmonitor_conf () {
-	my @conf;
-	my $timespan = 30 * 60;
-	my %timespans;
-	my $rule;
-	open my $h, '<', $TRAFFICMONITOR_CONFFILE or do {
-		die "cannot open $TRAFFICMONITOR_CONFFILE: $OS_ERROR, stopped";
-	};
-	while (<$h>) {
-		next if m"^\s*(#|$)";
-		if    ( m"^\s*timespan\s+(\d+)$" ){
-			$timespan = int($1) * 60;
-		}elsif( m"^\s*trafficmonitor_rule\s*$" ){
-			$rule = {
-				'name' => "$TRAFFICMONITOR_CONFFILE:$.",
-				'timespan' => $timespan,
-			};
-			push @conf, $rule;
-			$timespans{$timespan} = 1;
-		}elsif( m"^\s*target\s+(\S.*)$" ){
-			my $re;
-			eval { $re = qr"^($1)$"; };
-			if( $@ ){ die "$TRAFFICMONITOR_CONFFILE:$.: $@, stopped"; }
-			push @{$$rule{targets}}, $re;
-		}elsif( m"^\s*boundary\s+(\S+)\s+\[(\d*),(\d*)\]\s*$" ){
-			push @{$$rule{boundaries}}, {
-				'name'      => "$TRAFFICMONITOR_CONFFILE:$.",
-				'viewpoint' => $1,
-				'lower'     => $2,
-				'upper'     => $3,
-			};
-		}else{
-			errorlog "$TRAFFICMONITOR_CONFFILE:$.: illegal format, ignored.";
-		}
-	}
-	close $h or do {
-		die "close failed for $TRAFFICMONITOR_CONFFILE: $OS_ERROR, stopped";
-	};
-	$RECENT_TRAFFICMONITOR_CONF = \@conf;
-	@$RECENT_TRAFFIC_SUBTIMESPANS = sort {$a <=> $b} keys %timespans;
-}
-
-sub remove_traffic_count ($) {
-	my ($f) = @_;
-	unlink $f if -f $f;
-}
-
-sub save_traffic_count ($$) {
-	my ($f, $count) = @_;
-	open my $h, ">", $f or die;
-	foreach my $name ( sort keys %$count ){
-		my $value = $$count{$name};
-		print $h "$name	$value\n";
-	}
-	close $h;
-}
-
-sub load_traffic_count ($) {
-	my ($f) = @_;
-	my %count;
-	open my $h, "<", $f or die;
-	while( <$h> ){
-		chomp;
-		next unless m"^(\S+)\s+(\d+)";
-		$count{$1} = $2;
-	}
-	close $h;
-	return \%count;
-}
-
-
-sub update_traffic_timeline () {
-	if( @TRAFFIC_TIMELINE and $TRAFFIC_TIMELINE[-1]->{sliceepoch} >= $LATEST_TRAFFIC_SLICEEPOCH ){
-		$LATEST_TRAFFIC_SLICE = $TRAFFIC_TIMELINE[-1];
-		return;
-	}
-
-	$LATEST_TRAFFIC_SLICE = {
-		'sliceepoch' => $LATEST_TRAFFIC_SLICEEPOCH,
-		'count'      => {},
-		'save_required' => 1,
-	};
-	push @TRAFFIC_TIMELINE, $LATEST_TRAFFIC_SLICE;
-	foreach my $timespan ( @$RECENT_TRAFFIC_SUBTIMESPANS ){
-		push @{$$RECENT_TRAFFIC_SUBTIMELINE{$timespan}}, $LATEST_TRAFFIC_SLICE;
-	}
-}
-
-sub save_traffic_timeline () {
-	my $now = time;
-	foreach my $slice ( @TRAFFIC_TIMELINE ){
-		my $save_required = $$slice{save_required};
-		next unless $$slice{save_required};
-		my $sliceepoch = $$slice{sliceepoch};
-		next unless $sliceepoch < $now - 90;
-
-		my $sliceepoch = $$slice{sliceepoch};
-		my $count = $$slice{count};
-		my $sliceepoch_string = unixtime2timestring $sliceepoch;
-		my $f = "$TRAFFICDIR/$sliceepoch_string.traffic";
-		save_traffic_count $f, $count;
-		$$slice{save_required} = undef;
-
-		infolog "save_traffic_window: $sliceepoch_string: saved.";
-	}
-}
-
-sub load_traffic_timeline () {
-	opendir my $h, $TRAFFICDIR or die;
-	my @r;
-	while( my $e = readdir $h ){
-		next unless $e =~ m"^(\d{4}-\d{2}-\d{2}_\d{2}:\d{2})\.traffic$";
-		my $sliceepoch_string = $1;
-		my $sliceepoch = timestring2unixtime $sliceepoch_string;
-		my $f = "$TRAFFICDIR/$sliceepoch_string.traffic";
-		my $count = load_traffic_count $f;
-
-		push @r, {
-			'save_required' => undef,
-			'sliceepoch' => $sliceepoch,
-			'count' => $count,
-		};
-
-		infolog "load_traffic_timeline: $sliceepoch_string: loaded.";
-	}
-	push @TRAFFIC_TIMELINE, sort { $$a{sliceepoch}<=>$$b{sliceepoch} } @r;
-}
-
-sub keep_traffic_timeline () {
-	my $timespan = 60 * 60;
-	while( @TRAFFIC_TIMELINE ){
-		my $sliceepoch = $TRAFFIC_TIMELINE[0]->{sliceepoch};
-		my $elapsed = $LATEST_TRAFFIC_SLICEEPOCH - $sliceepoch;
-		last if $elapsed <= $timespan;
-		my $sliceepoch_string = unixtime2timestring $sliceepoch;
-		my $f = "$TRAFFICDIR/$sliceepoch_string.traffic";
-		remove_traffic_count $f;
-		shift @TRAFFIC_TIMELINE;
-	}
-}
-
-sub write_pidfile ($) {
-	my ($pid) = @_;
-	my $f = $PIDFILE;
-	open my $h, '>', $f or die;
-	print $h "$pid\n";
-	close $h;
-	return;
-}
-
-sub read_pidfile () {
-	my $f = $PIDFILE;
-	open my $h, '<', $f or return undef;
-	my $pid = <$h>;
-	close $h;
-	return undef unless kill 0, $pid;
-	return $pid;
-}
-
-#
-
-our $CONCATFILTER_BUFF;
-our $CONCATFILTER_LASTMODIFIED;
-our @CONCATFILTER_EXPIRED;
-
-sub load_concatfilter_buff () {
-	my $f = "$CONCATDIR/buffer.json";
-	my $decoder = JSON::XS->new;
-
-	open my $h, '<', $f or do {
-		$CONCATFILTER_BUFF = {};
-		$CONCATFILTER_LASTMODIFIED = {};
-		@CONCATFILTER_EXPIRED = ();
-		return;
-	};
-	my $json = join '', <$h>;
-	close $h;
-	my $now = time;
-	$CONCATFILTER_BUFF = $decoder->decode( $json );
-	while( my ($k, $v) = each %$CONCATFILTER_BUFF ){
-		foreach my $i ( @$v ){
-			utf8::encode($i);
-		}
-		$$CONCATFILTER_LASTMODIFIED{$k} = $now;
-	}
-	@CONCATFILTER_EXPIRED = ();
-}
-
-sub save_concatfilter_buff () {
-	my $f = "$CONCATDIR/buffer.json";
-	my $encoder = JSON::XS->new;
-
-	my $log = $encoder->encode( $CONCATFILTER_BUFF );
-	open my $h, '>', $f or die;
-	print $h "$log\n";
-	close $h;
-	return;
-}
-
-####
-
-sub get_concatfilter_rule ($) {
-	my ($tag) = @_;
-	my $cache = $RECENT_CONCATFILTER_RULECACHE;
-
-	if( exists $$cache{$tag} ){ return @{$$cache{$tag}}; }
-
-	my $conf = $RECENT_CONCATFILTER_CONF;
-	foreach my $rule ( @$conf ){
-		my $name     = $$rule{name};
-		my $targets  = $$rule{targets};
-		my $type     = $$rule{type};
-		my $limit_line = $$rule{limit_line};
-		my $limit_time = $$rule{limit_time};
-		my $patterns = $$rule{patterns};
-		foreach my $target ( @$targets ){
-			next unless $tag =~ m"$target";
-
-			infolog "get_concatfilter_rule: $tag => $name";
-
-			@{$$cache{$tag}} = ($name, $type, $limit_line, $limit_time, $patterns);
-			return @{$$cache{$tag}};
-		}
-	}
-	@{$$cache{$tag}} = (undef, undef, undef, undef, undef);
-	return undef, undef, undef, undef, undef;
-}
-
-sub get_anomalymonitor_rule ($) {
-	my ($tag) = @_;
-	my $cache = $RECENT_ANOMALYMONITOR_RULECACHE;
-
-	if( exists $$cache{$tag} ){ return @{$$cache{$tag}}; }
-
-	my $conf = $RECENT_ANOMALYMONITOR_CONF;
-	foreach my $rule ( @$conf ){
-		my $name           = $$rule{name};
-		my $targets        = $$rule{targets};
-		my $pattern        = $$rule{pattern};
-		my $pattern_regexp = $$rule{pattern_regexp};
-		my $redirects      = $$rule{redirects};
-		foreach my $target ( @$targets ){
-			next unless $tag =~ m"$target";
-
-			my $captures = { %+ };
-			infolog "get_anomalymonitor_rule: $tag => $name";
-
-			@{$$cache{$tag}} = ($name, $pattern, $pattern_regexp, $redirects, $captures);
-			return @{$$cache{$tag}};
-		}
-	}
-	@{$$cache{$tag}} = (undef, undef, undef, undef, undef);
-	return undef, undef, undef, undef, undef;
-}
-
-sub get_transactionfilter_rules ($) {
-	my ($tag) = @_;
-	my $cache = $RECENT_TRANSACTIONFILTER_RULECACHE;
-
-	if( exists $$cache{$tag} ){ return @{$$cache{$tag}}; }
-
-	my $conf = $RECENT_TRANSACTIONFILTER_CONF;
-	my @result;
-	foreach my $rule ( @$conf ){
-		my $name   = $$rule{name};
-		my $inputs = $$rule{inputs};
-		my $output = $$rule{output};
-		my $tag_patterns     = $$rule{tag_patterns};
-		my $message_patterns = $$rule{message_patterns};
-		foreach my $input ( @$inputs ){
-			next unless $tag =~ m"$input";
-
-			infolog "get_transactionfilter_rules: $tag => $name => $output";
-			my $captures = {};
-			foreach my $tag_pattern ( @$tag_patterns ){
-				$tag =~ m"$tag_pattern" or next;
-				while( my ($k, $v) = each %+ ){
-					$$captures{$k} = $v;
-					infolog "get_transactionfilter_rules: tag_pattern: $k => $v";
-				}
-			}
-			push @result, [$name, $output, $message_patterns, $captures];
-		}
-	}
-	$$cache{$tag} = \@result;
-	return @result;
-}
-
-# timespan, tag => *(name, lower, upper, event);
-sub get_trafficmonitor_rules ($$) {
-	my ($timespan, $tag) = @_;
-	my $cache = $RECENT_TRAFFICMONITOR_RULECACHE;
-
-	if( exists $$cache{$timespan,$tag} ){ return @{$$cache{$timespan,$tag}}; }
-
-	my $conf = $RECENT_TRAFFICMONITOR_CONF;
-	my @r;
-	foreach my $rule ( @$conf ){
-		my $t = $$rule{timespan};
-		next unless $t == $timespan;
-		my $boundaries = $$rule{boundaries};
-		next unless defined $boundaries;
-		my $targets   = $$rule{targets};
-
-		foreach my $target ( @$targets ){
-			next unless $tag =~ m"$target";
-			push @r, @$boundaries;
-		}
-	}
-
-	$$cache{$timespan,$tag} = \@r;
-	return @r;
-}
-
-#### access control functions
-sub check_allow ($) {
-	my $ipaddr = shift;
-	return check_subnet_list $ipaddr, @$RECENT_ALLOWLIST;
-}
-
-#### concat buffer functions
-
-sub keep_concat_buffer () {
-	my $now = time;
-	while( my ($tag, $v) = each %$CONCATFILTER_BUFF ){
-		my $mtime = $$CONCATFILTER_LASTMODIFIED{$tag};
-		my ($name, $type, $limit_line, $limit_time, $patterns) = get_concatfilter_rule $tag;
-		next if $now - $mtime < $limit_time;
-		push @CONCATFILTER_EXPIRED, $tag;
-	}
-}
-
-#### traffic timeline functions
-
-sub process_traffic_timeline ($$) {
-	my ($tag, $num) = @_;
-	$$LATEST_TRAFFIC_SLICE{count}->{$tag} += $num;
-}
-
-sub process_traffic_subtimeline ($$$) {
-	my ($timespan, $tag, $num) = @_;
-	$$RECENT_TRAFFIC_SUBTOTAL{$timespan, $tag} += $num;
-
-	if( $num > 0 ){
-		my $now = time;
-		my @rules = get_trafficmonitor_rules $timespan, $tag;
-		foreach my $rule ( @rules ){
-			my $name = $$rule{name};
-			$$LATEST_TRAFFIC_ACTIVATETIME{$name} = $now;
-		}
-	}else{
-		if( $$RECENT_TRAFFIC_SUBTOTAL{$timespan, $tag} <= 0 ){
-			delete $$RECENT_TRAFFIC_SUBTOTAL{$timespan, $tag};
-		}
-	}
-}
-
-sub process_traffic_monitor ($$) {
-	my ($timespan, $tag) = @_;
-
-	my @rules = get_trafficmonitor_rules $timespan, $tag;
-	my $n = $$RECENT_TRAFFIC_SUBTOTAL{$timespan, $tag};
-	my $now = time;
-
-	foreach my $rule ( @rules ){
-		my $name      = $$rule{name};
-		my $viewpoint = $$rule{viewpoint};
-		my $lower     = $$rule{lower};
-		my $upper     = $$rule{upper};
-		my $status = $$RECENT_TRAFFIC_MONITORSTATUS{$name, $tag};
-		if( $lower ne '' && $n < $lower ){
-			unless($status eq 'under'){
-				my $log = $JSONENCODER->encode({
-					'monitorname' => $name,
-					'viewpoint'   => $viewpoint,
-					'tag'         => $tag,
-					'boundary'    => "[$lower,$upper]",
-					'subtotal'    => $n,
-					'status'      => 'UNDER',
-					'unixtime'    => $now,
-					'timestamp'   => $CURR_TIMESTAMP,
-				});
-				print $CURR_TRAFFIC_DETECTFH "$log\n";
-				$$RECENT_TRAFFIC_MONITORSTATUS{$name, $tag} = 'under';
-			}
-		}elsif( $upper ne '' && $n > $upper ){
-			unless($status eq 'over'){
-				my $log = $JSONENCODER->encode({
-					'monitorname' => $name,
-					'viewpoint'   => $viewpoint,
-					'tag'         => $tag,
-					'boundary'    => "[$lower,$upper]",
-					'subtotal'    => $n,
-					'status'      => 'OVER',
-					'unixtime'    => $now,
-					'timestamp'   => $CURR_TIMESTAMP,
-				});
-				print $CURR_TRAFFIC_DETECTFH "$log\n";
-				$$RECENT_TRAFFIC_MONITORSTATUS{$name, $tag} = 'over';
-			}
-		}else{
-			if    ($status eq 'under' || $status eq 'over'){
-				my $log = $JSONENCODER->encode({
-					'monitorname' => $name,
-					'viewpoint'   => $viewpoint,
-					'tag'         => $tag,
-					'boundary'    => "[$lower,$upper]",
-					'subtotal'    => $n,
-					'status'      => 'OK',
-					'unixtime'    => $now,
-					'timestamp'   => $CURR_TIMESTAMP,
-				});
-				print $CURR_TRAFFIC_DETECTFH "$log\n";
-				delete $$RECENT_TRAFFIC_MONITORSTATUS{$name, $tag};
-			}
-		}
-	}
-}
-
-sub keep_traffic_subtimeline () {
-	while( my ($timespan, $subtimeline) = each %$RECENT_TRAFFIC_SUBTIMELINE ){
-		while( @$subtimeline ){
-			my $sliceepoch = $$subtimeline[0]->{sliceepoch};
-			my $elapsed = $LATEST_TRAFFIC_SLICEEPOCH - $sliceepoch;
-			last if $elapsed <= $timespan;
-			my $expired_slice = shift @$subtimeline;
-			my $count = $$expired_slice{count};
-			infolog "keep_traffic_subtimeline: $timespan: expire slice $sliceepoch. ($elapsed sec elapsed)";
-			while( my ($tag, $num) = each %$count ){
-				process_traffic_subtimeline $timespan, $tag, -$num;
-				process_traffic_monitor $timespan, $tag;
-			}
-		}
-	}
-}
-
-sub monitor_traffic_activatetime () {
-	my $now = time;
-	foreach my $rule ( @$RECENT_TRAFFICMONITOR_CONF ){
-		my $timespan = $$rule{timespan};
-		my $boundaries = $$rule{boundaries};
-		foreach my $boundary ( @$boundaries ){
-			my $name      = $$boundary{name};
-			my $viewpoint = $$boundary{viewpoint};
-			my $lower     = $$boundary{lower};
-			my $upper     = $$boundary{upper};
-			next unless $lower ne '' && $lower > 0;
-
-			my $status = $$RECENT_TRAFFIC_MONITORSTATUS{$name};
-			my $latest = $$LATEST_TRAFFIC_ACTIVATETIME{$name};
-			if( $latest + $timespan < $now ){
-				infolog "monitor_traffic_activatetime: $name: $latest + $timespan < $now";
-				unless($status eq 'under'){
-					my $log = $JSONENCODER->encode({
-						'monitorname' => $name,
-						'viewpoint'   => $viewpoint,
-						'boundary'    => "[$lower,$upper]",
-						'status'      => 'EMPTY',
-						'unixtime'    => $now,
-						'timestamp'   => $CURR_TIMESTAMP,
-						'latest'      => $latest,
-					});
-					print $CURR_TRAFFIC_DETECTFH "$log\n";
-					$$RECENT_TRAFFIC_MONITORSTATUS{$name} = 'under';
-				}
-			}else{
-				if($status eq 'under'){
-					my $log = $JSONENCODER->encode({
-						'monitorname' => $name,
-						'viewpoint'   => $viewpoint,
-						'boundary'    => "[$lower,$upper]",
-						'status'      => 'OK',
-						'unixtime'    => $now,
-						'timestamp'   => $CURR_TIMESTAMP,
-					});
-					print $CURR_TRAFFIC_DETECTFH "$log\n";
-					$$RECENT_TRAFFIC_MONITORSTATUS{$name} = 'ok';
-				}
-			}
-		}
-	}
-}
-
-sub rebuild_traffic_subtimeline () {
-	$RECENT_TRAFFIC_SUBTOTAL = {};
-	$RECENT_TRAFFIC_SUBTIMELINE = {};
-	$RECENT_TRAFFIC_MONITORSTATUS = {};
-
-	foreach my $slice ( @TRAFFIC_TIMELINE ){
-		my $sliceepoch = $$slice{sliceepoch};
-		my $elapsed = $LATEST_TRAFFIC_SLICEEPOCH - $sliceepoch;
-		infolog "rebuild_traffic_subtimeline: calculate $sliceepoch.";
-
-		my @timespans;
-		foreach my $t ( @$RECENT_TRAFFIC_SUBTIMESPANS ){
-			push @timespans, $t if $elapsed <= $t;
-		}
-		next unless @timespans;
-
-		my $count = $$slice{count};
-		while( my ($tag, $num) = each %$count ){
-			foreach my $t ( @timespans ){
-				process_traffic_subtimeline $t, $tag, $num;
-			}
-		}
-		foreach my $t ( @timespans ){
-			push @{$$RECENT_TRAFFIC_SUBTIMELINE{$t}}, $slice;
-			infolog "rebuild_traffic_subtimeline: $t: add slice $sliceepoch.";
-		}
-	}
-	while( my ($timespan_tag, $subtotal) = each %$RECENT_TRAFFIC_SUBTOTAL ){
-		my ($timespan, $tag) = split m"\x1c";
-		process_traffic_monitor $timespan, $tag;
-	}
-}
-
-#### asynchronus signal functions
-
-sub update_timestamp () {
-	my $now = time;
-	my $mod = $now % 60;
-	my ($sec, $min, $hour, $day, $mon, $year) = localtime $now;
-	$CURR_TIMESTAMP = sprintf "%04d-%02d-%02d_%02d:%02d",
-		$year+1900, $mon+1, $day, $hour, $min, $sec;
-	$LATEST_TRAFFIC_SLICEEPOCH = $now - $mod;
-}
-
-sub reset_cache () {
-	$RECENT_CONCATFILTER_RULECACHE = {};
-	$RECENT_ANOMALYMONITOR_RULECACHE = {};
-	$RECENT_TRANSACTIONFILTER_RULECACHE = {};
-	$RECENT_TRAFFICMONITOR_RULECACHE = {};
-
-	$RECENT_ANOMALY_UNMONITOREDCACHE = {};
-	$RECENT_TRANSACTION_UNMONITOREDCACHE = {};
-	$RECENT_TRAFFIC_UNMONITOREDCACHE = {};
-}
-
-sub process_periodic () {
-	update_timestamp;
-
-	## concat filter
-	keep_concat_buffer;
-
-	## switch anomaly/traffic detect file, log file
-	update_filepath;
-
-	## traffic monitor
-	keep_traffic_subtimeline;
-	monitor_traffic_activatetime;
-
-	##
-	save_traffic_timeline;
-	update_traffic_timeline;
-	keep_traffic_timeline;
-}
-
-sub set_term ($) {
-	my ($d) = @_;
+sub set_child_term_handler ($) {
+	my ($server_socket) = @_;
 	$SIG{'TERM'} = sub {
 		#$d->shutdown;
-		infolog "DEBUG: SIGTERM";
-		$d->close;
+		$RUNTIME->tracelog("[STEP] child daemon recieved SIGTERM");
+		$server_socket->close;
 	};
 }
 
-sub set_reload () {
+sub set_child_ping_handler ($) {
+	my ($last_ping_time) = @_;
+	$SIG{'USR1'} = sub {
+		$RUNTIME->tracelog("[STEP] recieved ping.");
+		$$last_ping_time = time;
+	};
+}
+
+sub set_child_reload_handler () {
 	$SIG{'HUP'} = sub {
-		infolog "DEBUG: SIGHUP";
-		infolog "[STEP] updating timestamp...";
-		update_timestamp;
-		update_filepath;
-		update_allowlist;
-		update_traffic_timeline;
-		infolog "[STEP] reading configurations...";
-		reset_cache;
-		read_concatfilter_conf;
-		read_anomalymonitor_conf;
-		read_transactionfilter_conf;
-		read_trafficmonitor_conf;
-		rebuild_traffic_subtimeline;
-		infolog "[STEP] reloading is complete.";
+		die "child daemon cannot accept HUP signal, stopped";
 	};
 }
 
-sub set_periodic () {
+sub set_child_periodic_handler ($$) {
+	my ($last_ping_time, $last_pong_time) = @_;
 	my $now = time;
 	my $next_period = 60 - ( ($now-3) % 60 );
 	$next_period += 60 if $next_period < 10;
 	$SIG{ALRM} = sub {
+		$RUNTIME->infolog("process_periodic_as_child: now=$now, next=$next_period");
 		eval {
-			process_periodic;
-			&set_periodic;
+			process_periodic_as_child;
+			set_child_periodic_handler( $last_ping_time, $last_pong_time );
+
+			if( $$last_ping_time > $$last_pong_time ){
+				kill 'USR1', getppid;
+				$$last_pong_time = time;
+				$RUNTIME->tracelog("[STEP] sent pong.");
+			}
 		};
 		if( $@ ne '' ){
-			infolog "process_periodic: error: $@";
+			$RUNTIME->infolog("process_periodic_as_child: error: $@");
 		}
         };
         alarm $next_period;
 }
 
-####
+## Web API action functions
 
-sub process_concat_filter ($$$) {
-	my ($tag, $messages, $cmessages) = @_;
-
-	my ($name, $type, $limit_line, $limit_time, $patterns) = get_concatfilter_rule $tag;
-	unless( defined $name ){
-		foreach my $m (@$messages){
-			push @$cmessages, $m;
-		}
-		return;
+sub add_events_to_transactions ($$$) {
+	my ($trxid2times, $events, $unmonitored) = @_;
+	foreach my $i ( @$events ){
+		#my $tag     = $$i{tag};
+		my $pattern = $$i{pattern};
+		my $event   = $$i{event};
+		$$trxid2times{"anomaly.all"}++;
+		#$$trxid2times{"anomaly.by_tag.$tag"}++;
+		$$trxid2times{"anomaly.by_pattern.$pattern"}++;
+		$$trxid2times{"anomaly.by_event.$event"}++;
 	}
-
-	if( $type eq "pattern-first" ){
-		my $now = time;
-		my $buff = $$CONCATFILTER_BUFF{$tag};
-		$$CONCATFILTER_LASTMODIFIED{$tag} = $now;
-		unless( defined $buff ){
-			$buff = [];
-			$$CONCATFILTER_BUFF{$tag} = $buff;
-		}
-
-		foreach my $m (@$messages){
-			next if $m eq '';
-
-			my $hit = undef;
-			if( @$buff > $limit_line ){
-				$hit = 1;
-			}else{
-				foreach my $pattern ( @$patterns ){
-					next unless $m =~ m"$pattern";
-					$hit = 1;
-					last;
-				}
-			}
-
-			unless( $hit ){
-				push @$buff, $m;
-			}elsif( @$buff ){
-				my $cm = join "\x1f", @$buff;
-				push @$cmessages, $cm;
-				@$buff = ($m);
-			}else{
-				@$buff = ($m);
-			}
-		}
-	}else{
-		foreach my $m (@$messages){
-			push @$cmessages, $m;
-		}
+	foreach my $i ( @$unmonitored ){
+		#my $tag     = $$i{tag};
+		$$trxid2times{"unmonitored.all"}++;
+		#$$trxid2times{"unmonitored.by_tag.$tag"}++;
 	}
 }
 
-sub process_anomaly_monitor ($$$) {
-	my ($tag, $cmessages, $new_cmessages_with_tag) = @_;
+sub monitor_content ($) {
+	my ($content) = @_;
 
-	my ($name, $pattern, $regexp, $redirects, $captures) = get_anomalymonitor_rule $tag;
-	unless( defined $name ){
-		return if $$RECENT_ANOMALY_UNMONITOREDCACHE{$tag};
-		infolog "process_anomaly_monitor: unmonitored $tag";
-		$$RECENT_ANOMALY_UNMONITOREDCACHE{$tag} = 1;
-		return;
-	}
+	$RUNTIME->tracelog("[STEP] processing messages...");
+	my $tag2messages  = $RUNTIME->content2tag2messages( $content );
 
-	foreach my $m ( @$cmessages ){
-		tracelog "process_anomaly_monitor: $pattern: check \"%s\"", $m;
-		my $event;
-		if( $m =~ m"$regexp" ){
-			if( $+[0] == length($m) ){
-				$event = $REGMARK;
-			}else{
-				accesslog "process_anomaly_monitor: %s:%s: %d != %d", $pattern, $REGMARK, $+[0], length($m);
-				$event = $REGMARK;
-			}
-		}else{
-			$event = "ANOMALY";
-		}
-		next if $event =~ m"WELLKNOWN";
-		tracelog "process_anomaly_monitor: $pattern: $event: hit.";
+	$RUNTIME->tracelog("[STEP] processing concatination filters...");
+	my $tag2cmessages = {};
+	my $rmessages     = {};
+	my $events        = [];
+	my $unmonitored   = [];
+	my $trxid2times   = {};
+	$RUNTIME->passthrough_all_concatfilters( $tag2messages,  $tag2cmessages );
+	return unless %$tag2cmessages;
 
-		if( $redirects ){
-			my %params = %+;
-			while( my ($k, $v) = each %$captures ){
-				$params{$k} = $v;
-			}
+	$RUNTIME->tracelog("[STEP] monitoring anomaly messages...");
+	$RUNTIME->monitor_anomalies_repeatedly ( $tag2cmessages, $rmessages, $events, $unmonitored );
 
-			my $redirected = undef;
-			foreach my $redirect ( @$redirects ){
-				my $r_name    = $$redirect{name};
-				my $r_event   = $$redirect{event};
-				my $r_tag     = $$redirect{tag};
-				my $r_message = $$redirect{message};
-				next unless $r_event eq $event;
+	$RUNTIME->tracelog("[STEP] writing anomaly events...");
+	$RUNTIME->write_anomaly_events         ( $events );
+	$RUNTIME->write_unmonitored_messages   ( $unmonitored );
 
-				my $t = expand_tag $r_tag, %params;
-				my $m = expand_tag $r_message, %params;
-				next if $t eq '';
-				next if $m eq '';
-				push @{$$new_cmessages_with_tag{$t}}, $m;
-				$redirected = 1;
-				tracelog "process_anomaly_monitor: $event: redirected to $t.";
-			}
-			next if $redirected;
-		}
+	$RUNTIME->tracelog("[STEP] processing transaction filters...");
+	$RUNTIME->passthrough_all_transactionfilters( $rmessages, $trxid2times );
+	add_events_to_transactions $trxid2times, $events, $unmonitored;
 
-		utf8::decode($m);
-		my $log = $JSONENCODER->encode( {
-			'message'   => $m,
-			'tag'       => $tag,
-			'pattern'   => $pattern,
-			'event'     => $event,
-			'unixtime'  => time,
-			'timestamp' => $CURR_TIMESTAMP,
-		} );
-		utf8::encode($log);
-		print $CURR_ANOMALY_DETECTFH "$log\n";
-	}
-}
-
-sub process_transaction_filter ($$$) {
-	my ($tag, $cmessages, $transactions_with_tag) = @_;
-
-	my @rules = get_transactionfilter_rules $tag;
-	unless( @rules ){
-		return if $$RECENT_TRANSACTION_UNMONITOREDCACHE{$tag};
-		infolog "process_transaction_filter: unmonitored $tag";
-		$$RECENT_TRANSACTION_UNMONITOREDCACHE{$tag} = 1;
-		return;
-	}
-
-	foreach my $m ( @$cmessages ){
-		foreach my $rule ( @rules ){
-			my ($name, $output, $message_patterns, $captures) = @$rule;
-			#infolog "DEBUG10: $tag => $m";
-
-			my %captures = %$captures;
-			foreach my $message_pattern ( @$message_patterns ){
-				$m =~ $message_pattern or next;
-				while( my ($k, $v) = each %+ ){
-					$captures{$k} = $v;
-				}
-			}
-			my $t = expand_tag $output, %captures;
-			#infolog "DEBUG11: $output => $t";
-			$$transactions_with_tag{$t}++;
-		}
-	}
-}
-
-sub process_concatfilter_step ($$) {
-	my ($tag2messages, $tag2cmessages) = @_;
-	while( my ($tag, $messages) = each %$tag2messages ){
-		my $num = @$messages;
-		## concat filter
-		my $cmessages = [];
-		process_concat_filter $tag, $messages, $cmessages;
-		push @{$$tag2cmessages{$tag}}, @$cmessages;
-	}
-}
-
-sub process_anomalymonitor_step ($$) {
-	my ($tag2cmessages, $next_tag2cmessages) = @_;
-	while( my ($tag, $cmessages) = each %$tag2cmessages ){
-		## anomaly monitor
-		process_anomaly_monitor $tag, $cmessages, $next_tag2cmessages;
-	}
-}
-
-sub process_transactionfilter_step ($$) {
-	my ($tag2cmessages, $tag2transactions) = @_;
-	while( my ($tag, $cmessages) = each %$tag2cmessages ){
-		## transaction filter
-		process_transaction_filter $tag, $cmessages, $tag2transactions;
-	}
-}
-
-sub process_trafficmonitor_step ($) {
-	my ($tag2transactions) = @_;
-	while( my ($tag, $num) = each %$tag2transactions ){
-		process_traffic_timeline $tag, $num;
-		foreach my $timespan ( @$RECENT_TRAFFIC_SUBTIMESPANS ){
-			process_traffic_subtimeline $timespan, $tag, $num;
-			process_traffic_monitor $timespan, $tag;
-		}
-	}
-}
-
-sub process_anomalymonitor_loop ($$) {
-	my ($tag2cmessages, $tag2transactions) = @_;
-	my $i = 0;
-	while( %$tag2cmessages ){
-		unless( $i++ < 10 ){
-			last;
-		}
-		my $next_tag2cmessages = {};
-		process_anomalymonitor_step $tag2cmessages, $next_tag2cmessages;
-		process_transactionfilter_step $tag2cmessages, $tag2transactions;
-		$tag2cmessages = $next_tag2cmessages;
-	}
-}
-
-####
-sub content2tag2messages ($) {
-	my $content = shift;
-	my $decoder = JSON::XS->new;
-	my $tag2messages = {};
-	foreach my $i ( split m"\n", $content ){
-		next if $i eq "";
-		my $j = $i;
-		utf8::decode($i);
-		my $log;
-		eval {
-			$log = $decoder->decode( $i );
-		};
-		unless( defined $log ){
-			infolog "action_monitor: cannot JSON::XS::decode: log=\"%s\"", $j;
-			if( $@ ){
-				infolog "action_monitor: illegal format log \"%s\"", $@;
-			}
-			next;
-		}
-		my $tag = $$log{tag};
-		my $message = $$log{message};
-		next if $message eq "";
-		utf8::encode($message);
-		push @{$$tag2messages{$tag}}, $message;
-	}
-	return $tag2messages;
-}
-
-sub preaction () {
-	if( @CONCATFILTER_EXPIRED ){
-		my $tag2cmessages    = {};
-		my $tag2transactions = {};
-		while( my $i = pop @CONCATFILTER_EXPIRED ){
-			next unless defined $$CONCATFILTER_BUFF{$i};
-			push @{$$tag2cmessages{$i}},
-				join "\x1f", @{$$CONCATFILTER_BUFF{$i}};
-			delete $$CONCATFILTER_BUFF{$i};
-			delete $$CONCATFILTER_LASTMODIFIED{$i};
-		}
-
-		infolog "[STEP] processing messages... (preaction)";
-		process_anomalymonitor_loop $tag2cmessages, $tag2transactions;
-
-		infolog "[STEP] processing transactions... (preaction)";
-		process_trafficmonitor_step $tag2transactions;
-
-		infolog "[STEP] preaction is complete.";
-	}
+	$RUNTIME->tracelog("[STEP] counting transactions...");
+	$RUNTIME->add_transactions( $trxid2times );
 }
 
 sub action_monitor ($$) {
@@ -1409,15 +163,7 @@ sub action_monitor ($$) {
 
 	$TOTALLOG += length $content;
 
-	infolog "[STEP] processing messages...";
-	my $tag2messages     = content2tag2messages $content;
-	my $tag2cmessages    = {};
-	my $tag2transactions = {};
-	process_concatfilter_step   $tag2messages,  $tag2cmessages;
-	process_anomalymonitor_loop $tag2cmessages, $tag2transactions;
-
-	infolog "[STEP] processing transactions...";
-	process_trafficmonitor_step $tag2transactions;
+	monitor_content $content;
 
 	my $res = HTTP::Response->new;
 	$res->code(200);
@@ -1425,7 +171,7 @@ sub action_monitor ($$) {
 	$res->content('');
 	$conn->send_response($res);
 
-	infolog "[STEP] action \"monitor\" is complete.";
+	$RUNTIME->tracelog("[STEP] action \"monitor\" is complete.");
 }
 
 sub action_debug ($$) {
@@ -1435,11 +181,11 @@ sub action_debug ($$) {
 	$res->code(200);
 	$res->header('Content-Type' => 'text/plain');
 	$res->content( Dumper({
-		'LATEST_TRAFFIC_SLICE' => $LATEST_TRAFFIC_SLICE,
-		'TRAFFIC_TIMELINE'     => \@TRAFFIC_TIMELINE,
-		'TRAFFIC_SUBTIMESPANS' => $RECENT_TRAFFIC_SUBTIMESPANS,
-		'TRAFFIC_SUBTOTAL'     => $RECENT_TRAFFIC_SUBTOTAL,
-		'TRAFFIC_SUBTIMELINE'  => $RECENT_TRAFFIC_SUBTIMELINE,
+		'LATEST_TRAFFIC_SLICE' => $$RUNTIME{VOLATILE}->{LATEST_TRAFFIC_SLICE},
+		'TRAFFIC_TIMELINE'     => $$RUNTIME{VOLATILE}->{TRAFFIC_TIMELINE},
+		'TRAFFIC_SUBTIMESPANS' => $$RUNTIME{VOLATILE}->{RECENT_TRAFFIC_SUBTIMESPANS},
+		'TRAFFIC_SUBTOTAL'     => $$RUNTIME{VOLATILE}->{RECENT_TRAFFIC_SUBTOTAL},
+		'TRAFFIC_SUBTIMELINE'  => $$RUNTIME{VOLATILE}->{RECENT_TRAFFIC_SUBTIMELINE},
 	}) );
 	$conn->send_response($res);
 }
@@ -1456,43 +202,35 @@ sub action_alive ($) {
 	$conn->send_response($res);
 }
 
+sub action_status_traffic_volume ($) {
+	my ($conn) = @_;
+	my $traffic_volume = $$RUNTIME{traffic_volume};
+	my $encoder = JSON::XS->new->pretty(1)->indent(4)->space_after(1);
+	my $res = HTTP::Response->new;
+	$res->code(200);
+	$res->header('Content-Type' => 'text/plain');
+	$res->content( $encoder->encode($$traffic_volume{TIMESPAN2VOLUME}) );
+	$conn->send_response($res);
+}
+
+sub action_status_traffic_status ($) {
+	my ($conn) = @_;
+	my $volatile = $$RUNTIME{volatile};
+	my $encoder = JSON::XS->new->pretty(1)->indent(4)->space_after(1);
+	my $res = HTTP::Response->new;
+	$res->code(200);
+	$res->header('Content-Type' => 'text/plain');
+	$res->content( $encoder->encode($$volatile{trafficstatus}) );
+	$conn->send_response($res);
+}
+
 sub action_status_timeline ($) {
 	my ($conn) = @_;
 	my $encoder = JSON::XS->new->pretty(1)->indent(4)->space_after(1);
 	my $res = HTTP::Response->new;
 	$res->code(200);
 	$res->header('Content-Type' => 'text/plain');
-	$res->content( $encoder->encode(\@TRAFFIC_TIMELINE) );
-	$conn->send_response($res);
-}
-
-sub action_status_subtimeline ($) {
-	my ($conn) = @_;
-	my $encoder = JSON::XS->new->pretty(1)->indent(4)->space_after(1);
-	my $res = HTTP::Response->new;
-	$res->code(200);
-	$res->header('Content-Type' => 'text/plain');
-	$res->content( $encoder->encode($RECENT_TRAFFIC_SUBTIMELINE) );
-	$conn->send_response($res);
-}
-
-sub action_status_subtotal ($) {
-	my ($conn) = @_;
-	my $encoder = JSON::XS->new->pretty(1)->indent(4)->space_after(1);
-	my $res = HTTP::Response->new;
-	$res->code(200);
-	$res->header('Content-Type' => 'text/plain');
-	$res->content( $encoder->encode($RECENT_TRAFFIC_SUBTOTAL) );
-	$conn->send_response($res);
-}
-
-sub action_status_latestslice ($) {
-	my ($conn) = @_;
-	my $encoder = JSON::XS->new->pretty(1)->indent(4)->space_after(1);
-	my $res = HTTP::Response->new;
-	$res->code(200);
-	$res->header('Content-Type' => 'text/plain');
-	$res->content( $encoder->encode($LATEST_TRAFFIC_SLICE) );
+	$res->content( $encoder->encode($$RUNTIME{traffic_volume}->{TIMESPAN2TIMELINE}) );
 	$conn->send_response($res);
 }
 
@@ -1509,36 +247,307 @@ sub action_status_rulecaches ($) {
 	$res->code(200);
 	$res->header('Content-Type' => 'text/plain');
 	$res->content( $encoder->encode({
-		'CONCATFILTER'		=> $RECENT_CONCATFILTER_RULECACHE,
-		'ANOMALYMONITOR'	=> $RECENT_ANOMALYMONITOR_RULECACHE,
-		'TRANSACTIONTFILTER'	=> $RECENT_TRANSACTIONFILTER_RULECACHE,
-		'TRAFFICMONITOR'	=> $RECENT_TRAFFICMONITOR_RULECACHE,
+		'CONCATFILTER'		=> $$RUNTIME{CONF}->{CONCATFILTER_RULECACHE},
+		'ANOMALYMONITOR'	=> $$RUNTIME{CONF}->{ANOMALYMONITOR_RULECACHE},
+		'TRANSACTIONTFILTER'	=> $$RUNTIME{CONF}->{TRANSACTIONFILTER_RULECACHE},
+		'TRAFFICMONITOR'	=> $$RUNTIME{CONF}->{TRAFFICMONITOR_RULECACHE},
 	}) );
 	$conn->send_response($res);
 }
 
-sub action_status_unmonitoredcaches ($) {
-	my ($conn) = @_;
-	my $encoder = JSON::XS->new->pretty(1)->indent(4)->space_after(1);
-	my $res = HTTP::Response->new;
-	$res->code(200);
-	$res->header('Content-Type' => 'text/plain');
-	$res->content( $encoder->encode({
-		'ANOMALY'	=> $RECENT_ANOMALY_UNMONITOREDCACHE,
-		'TRANSACTION'	=> $RECENT_TRANSACTION_UNMONITOREDCACHE,
-		'TRAFFIC'	=> $RECENT_TRAFFIC_UNMONITOREDCACHE,
-	}) );
-	$conn->send_response($res);
+##
+
+sub keep_child_daemon ($) {
+	my ($server_socket) = @_;
+
+	# the daemon process rename itself.
+	$0 = "$NAME [child]";
+
+	$RUNTIME->tracelog("[STEP] load traffic timelines...");
+	$RUNTIME->load_status;
+
+	my $last_ping_time;
+	my $last_pong_time;
+
+	unset_child_child_handler;
+	set_child_term_handler $server_socket;
+	set_child_ping_handler \$last_ping_time;
+	set_child_reload_handler;
+	set_child_periodic_handler \$last_ping_time, \$last_pong_time;
+
+	$RUNTIME->tracelog("[STEP] starting daemon...");
+	eval { while(1) {
+		my ($conn, $peer_addr) = $server_socket->accept;
+		unless( $conn ){
+			last unless defined fileno $server_socket;
+			next;
+		}
+
+		my $req = $conn->get_request;
+		next unless $req;
+		my $method = $req->method;
+		my $path = uri_unescape $req->uri->path;
+		my ($port, $bin_addr) = unpack_sockaddr_in $peer_addr;
+		my $addr = inet_ntoa $bin_addr;
+		$RUNTIME->accesslog('req: client=%s:%d method=%s path=%s',
+			$addr, $port, $method, $path);
+
+		unless( $RUNTIME->is_allowing_client_ipaddr($bin_addr) ){
+			$RUNTIME->accesslog('error: denied.');
+			$conn->send_error(RC_FORBIDDEN);
+			$conn->close;
+			undef $conn;
+			next;
+		}
+
+		my $content = $req->content;
+		if    ( $path =~ m"^/monitor/" ){
+			action_monitor $conn, $content;
+		}elsif( $path =~ m"^/debug/" ){
+			action_debug   $conn, $content;
+		}elsif( $path =~ m"^/status/(alive|timeline|traffic_volume|traffic_status|rulecaches)(/.*)$" ){
+			if    ( $1 eq 'alive' ){
+				action_alive              $conn;
+			}elsif( $1 eq 'timeline' ){
+				action_status_timeline    $conn;
+			}elsif( $1 eq 'traffic_volume' ){
+				action_status_traffic_volume $conn;
+			}elsif( $1 eq 'traffic_status' ){
+				action_status_traffic_status $conn;
+			}elsif( $1 eq 'rulecaches' ){
+				action_status_rulecaches  $conn;
+			}
+		}else{
+			$conn->send_error(RC_FORBIDDEN);
+		}
+		$conn->close;
+	} };
+
+	if( $@ ne '' ){
+		$RUNTIME->infolog("cmd_daemon: error: $@");
+	}
+
+	$RUNTIME->tracelog("[STEP] save status...");
+	$RUNTIME->finalize;
+
+	$RUNTIME->tracelog("[STEP] shutdown child daemon.");
+
+	exit 0;
 }
 
 
-####
-sub cmd_cron () {
-	die;
+#### parent daemon functions
+
+sub set_parent_child_handler ($$) {
+	my ($child_pid, $child_exitstatus) = @_;
+
+	$SIG{'CHLD'} = sub {
+		$$child_exitstatus = waitpid $$child_pid, 0;
+		$$child_pid = undef;
+	};
+}
+
+sub unset_parent_child_handler () {
+	$SIG{'CHLD'} = 'IGNORE';
+}
+
+sub set_parent_term_handler ($) {
+	my ($server_socket) = @_;
+	$SIG{'TERM'} = sub {
+		$RUNTIME->infolog_as_parent("DEBUG: parent daemon recieved SIGTERM");
+		$server_socket->close;
+	};
+}
+
+sub set_parent_pong_handler ($) {
+	my ($last_pong_time) = @_;
+	$SIG{'USR1'} = sub {
+		$RUNTIME->infolog_as_parent("recieved pong.");
+		$$last_pong_time = time;
+	};
+}
+
+sub set_parent_reload_handler ($$) {
+	my ($child_must_restart_ref, $parent_must_reload_ref) = @_;
+
+	$SIG{'HUP'} = sub {
+		$$child_must_restart_ref = 1;
+		$$parent_must_reload_ref = 1;
+		$RUNTIME->infolog_as_parent("reloading...");
+	};
+}
+
+##
+
+sub generate_child_daemon ($) {
+	my ($server_socket) = @_;
+	my $child_pid;
+	unless( $child_pid = fork ){
+		keep_child_daemon $server_socket;
+		exit 127;
+	}
+	return $child_pid;
+}
+
+sub stop_child_from_parent ($) {
+	my ($child_pid) = @_;
+	return 1 unless defined $child_pid;
+	return 1 unless kill 0, $child_pid;
+
+	kill 'TERM', $child_pid;
+	for( my $i = 0; $i < 10; $i++ ){
+		sleep 1;
+		unless( kill 0, $child_pid ){
+			return 1;
+		}
+	}
+	kill 'KILL', $child_pid;
+	for( my $i = 0; $i < 10; $i++ ){
+		sleep 1;
+		unless( kill 0, $child_pid ){
+			return 1;
+		}
+	}
+	return 0;
+}
+
+sub keep_parent_daemon () {
+	# the daemon process rename itself.
+	$0 = "$NAME";
+
+	$RUNTIME->infolog_as_parent("starting daemon...");
+	my ($addr, $port) = $RUNTIME->get_daemon_listen_addrport;
+
+	my $server_socket = HTTP::Daemon->new(
+		'Listen'    => 64,
+		'ReuseAddr' => 1,
+		'LocalAddr' => $addr,
+		'LocalPort' => $port,
+	) or do {
+		die sprintf 'cannot listen %s:%d: %s, stopped', $addr, $port, $OS_ERROR;
+	};
+
+	my $child_pid;
+	my $child_exitstatus;
+
+	my $child_is_running = 1;
+	my $child_must_restart = undef;
+	my $parent_must_reload = undef;
+
+	my $last_ping_time;
+	my $last_pong_time;
+
+	unset_parent_child_handler;
+	set_parent_term_handler   $server_socket;
+	set_parent_pong_handler   \$last_pong_time;
+	set_parent_reload_handler \$child_must_restart, \$parent_must_reload;
+
+	while (1) {
+		last unless defined fileno $server_socket;
+
+		unless( $child_is_running ){
+			my $exited_pid = waitpid $child_pid, 0;
+			$child_pid = undef;
+			$RUNTIME->infolog_as_parent("child daemon was stopped.");
+		}
+
+		if( $parent_must_reload ){
+			$RUNTIME->reload_as_parent;
+			$RUNTIME->infolog_as_parent("reloading is complete.");
+		}
+
+		if( $child_must_restart ){
+			$RUNTIME->infolog_as_parent("stopping child daemon...");
+			stop_child_from_parent $child_pid;
+			$child_pid = undef;
+		}
+
+		unless( defined $child_pid ){
+			$RUNTIME->infolog_as_parent("stating child daemon...");
+			$child_pid = generate_child_daemon $server_socket;
+			$child_is_running = 1;
+			$child_must_restart = undef;
+			$last_ping_time = $last_pong_time = time;
+			set_parent_child_handler  \$child_pid, \$child_exitstatus;
+		}
+
+		my $now = time;
+		if( $last_ping_time > $last_pong_time ){
+			if( $now < $last_ping_time + $PONG_EXPIRATION_SEC ){
+				$child_must_restart = 1;
+				next;
+			}
+		}else{
+			if( $now > $last_ping_time + $PING_RENEWAL_SEC ){
+				kill 'USR1', $child_pid;
+				$last_ping_time = $now;
+				$RUNTIME->infolog("sent ping.");
+			}
+		}
+
+		sleep 1;
+		select undef, undef, undef, 300;
+	}
+
+	$RUNTIME->infolog_as_parent("shutting down parent daemon...");
+	if( $child_pid ){
+		$RUNTIME->infolog_as_parent("stopping child daemon...");
+		stop_child_from_parent $child_pid;
+		my $exited_pid = waitpid $child_pid, 0;
+		$RUNTIME->infolog_as_parent("child daemon was stopped.");
+	}
+}
+
+sub generate_parent_daemon () {
+	my $parent_pid;
+	unless( $parent_pid = fork ){
+		$RUNTIME->write_pidfile;
+
+		my $daemon_user = $RUNTIME->get_daemon_user;
+		if( $daemon_user ne '-' ){
+			my ($name, $pw, $uid, $gid, $quota, $comment, $gcos,
+			    $home, $shell) = getpwnam $daemon_user;
+			unless( defined $uid and defined $gid ){
+				die "setuid: $daemon_user: not found, stopped";
+			}
+		
+			$( = $gid unless $( == $gid;
+			$) = $gid unless $) == $gid;
+			$< = $uid unless $< == $uid;
+			$> = $uid unless $> == $uid;
+			$ENV{HOME} = $home;
+		}
+
+		setsid;
+
+		open STDIN,  "<", "/dev/null" or die;
+		open STDOUT, ">", "/dev/null" or die;
+		open STDERR, ">", "/dev/null" or die;
+
+		eval {
+			keep_parent_daemon;
+		};
+		if( $@ ){
+			$RUNTIME->errorlog_as_parent("error occured: %s", $@);
+		}
+		exit 127;
+	}
+}
+
+#### sub commands
+
+sub cmd_daemon () {
+	if( $RUNTIME->read_pidfile ){
+		print STDERR "pid found.\n";
+		exit 2;
+	}
+
+	$RUNTIME->setup_as_daemon;
+	generate_parent_daemon;
 }
 
 sub cmd_kill () {
-	my $pid = read_pidfile;
+	my $pid = $RUNTIME->read_pidfile;
 	unless( defined $pid ){
 		print STDERR "no pidfile found.\n";
 		exit 1;
@@ -1551,7 +560,7 @@ sub cmd_kill () {
 }
 
 sub cmd_reload () {
-	my $pid = read_pidfile;
+	my $pid = $RUNTIME->read_pidfile;
 	unless( defined $pid ){
 		print STDERR "no pidfile found.\n";
 		exit 1;
@@ -1563,168 +572,28 @@ sub cmd_reload () {
 	kill 'HUP', $pid;
 }
 
-sub daemonize () {
-	# the parent process exits.
-	my $pid = fork;
-	if( $pid != 0 ){
-		write_pidfile $pid;
-		exit 0;
-	}
+##
 
-	my $daemon_user = $$RECENT_FOUCAULT03D_CONF{daemon_user};
-	if( $daemon_user ne '-' ){
-		my ($name, $pw, $uid, $gid, $quota, $comment, $gcos,
-		    $home, $shell) = getpwnam $daemon_user;
-		unless( defined $uid and defined $gid ){
-			die "setuid: $daemon_user: not found, stopped";
-		}
-		
-		$( = $gid unless $( == $gid;
-		$) = $gid unless $) == $gid;
-		$< = $uid unless $< == $uid;
-		$> = $uid unless $> == $uid;
-		$ENV{HOME} = $home;
-	}
-
-	# the daemon process rename itself.
-	$0 = $NAME;
-}
-
-sub cmd_daemon () {
-	my $conf = $RECENT_FOUCAULT03D_CONF;
-
-	daemonize;
-
-	my $d = HTTP::Daemon->new(
-		'Listen'    => 64,
-		'ReuseAddr' => 1,
-		'LocalAddr' => $$conf{listen_address},
-		'LocalPort' => $$conf{listen_port}
-	) or do {
-		die sprintf 'cannot listen %s:%d: %s, stopped',
-			$$conf{listen_address}, $$conf{listen_port}, $OS_ERROR;
-	};
-
-	$SIG{'CHLD'} = 'IGNORE';
-	set_term $d;
-	set_reload;
-	set_periodic;
-
-	eval { while (1) {
-		my ($conn, $peer_addr) = $d->accept;
-		preaction;
-		unless( $conn ){
-			last unless fileno $d;
-			next;
-		}
-
-		my $req = $conn->get_request;
-		next unless $req;
-		my $method = $req->method;
-		my $path = uri_unescape $req->uri->path;
-		my ($port, $bin_addr) = unpack_sockaddr_in $peer_addr;
-		my $addr = inet_ntoa $bin_addr;
-		accesslog 'req: client=%s:%d method=%s path=%s',
-			$addr, $port, $method, $path;
-
-		unless( check_allow $bin_addr ){
-			accesslog 'error: denied.';
-			$conn->send_error(RC_FORBIDDEN);
-			$conn->close;
-			undef $conn;
-			next;
-		}
-
-		my $content = $req->content;
-		if    ( $path =~ m"^/monitor/" ){
-			action_monitor $conn, $content;
-		}elsif( $path =~ m"^/debug/" ){
-			action_debug   $conn, $content;
-		}elsif( $path =~ m"^/status/(alive|timeline|subtimeline|subtotal|latestslice|rulecaches|unmonitoredcaches)(/.*)$" ){
-			if    ( $1 eq 'alive' ){
-				action_alive              $conn;
-			}elsif( $1 eq 'timeline' ){
-				action_status_timeline    $conn;
-			}elsif( $1 eq 'subtimeline' ){
-				action_status_subtimeline $conn;
-			}elsif( $1 eq 'subtotal' ){
-				action_status_subtotal    $conn;
-			}elsif( $1 eq 'latestslice' ){
-				action_status_latestslice $conn;
-			}elsif( $1 eq 'rulecaches' ){
-				action_status_rulecaches  $conn;
-			}elsif( $1 eq 'unmonitoredcaches' ){
-				action_status_unmonitoredcaches $conn;
-			}
-		}else{
-			$conn->send_error(RC_FORBIDDEN);
-		}
-		$conn->close;
-	} };
-
-	if( $@ ne '' ){
-		infolog "cmd_daemon: error: $@";
-	}
-	infolog "cmd_daemon: shutdown.";
-}
-
-####
-
-
-####
 if    ( $ARGV[0] eq "daemon" ){
-	read_foucault03d_conf;
-	init_filepath;
-	if( read_pidfile ){
-		print STDERR "pid found.\n";
-		exit 2;
-	}
-	update_timestamp;
-	update_filepath;
-	update_allowlist;
-	infolog "[STEP] reading configurations...";
-	reset_cache;
-	read_concatfilter_conf;
-	read_anomalymonitor_conf;
-	read_transactionfilter_conf;
-	read_trafficmonitor_conf;
-	infolog "[STEP] load traffic timelines...";
-	load_traffic_timeline;
-	keep_traffic_timeline;
-	update_traffic_timeline;
-	rebuild_traffic_subtimeline;
-	load_concatfilter_buff;
-	infolog "[STEP] starting daemon...";
+	$RUNTIME->setup_as_tool;
+
 	cmd_daemon;
-	infolog "[STEP] save status...";
-	save_concatfilter_buff;
 	exit 0;
+
 }elsif( $ARGV[0] eq "kill" ){
-	read_foucault03d_conf;
-	init_filepath;
+	$RUNTIME->setup_as_tool;
 
 	cmd_kill;
 	exit 0;
+
 }elsif( $ARGV[0] eq "reload" ){
-	read_foucault03d_conf;
-	init_filepath;
+	$RUNTIME->setup_as_tool;
 
 	cmd_reload;
 	exit 0;
-}elsif( $ARGV[0] eq "cron" ){
-	read_foucault03d_conf;
-	init_filepath;
-	update_timestamp;
-	update_filepath;
-	read_concatfilter_conf;
-	read_anomalymonitor_conf;
-	read_transactionfilter_conf;
-	read_trafficmonitor_conf;
 
-	cmd_cron;
-	exit 0;
 }else{
-	print "usage: % $0 {daemon|cron}\n";
+	print "usage: % $0 {daemon|kill|reload}\n";
 	exit 0;
 }
 

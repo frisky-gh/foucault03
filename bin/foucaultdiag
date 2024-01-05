@@ -1,0 +1,616 @@
+#!/usr/bin/perl
+
+our ($TOOLHOME, $PLUGINSDIR, $CONFDIR, $LOGDIR, $RUNDIR);
+BEGIN { 
+	$0 =~ m"^(.*)/";
+	$TOOLHOME = "$1/..";
+	while( $TOOLHOME =~ s{(^|/)[^\.][^/]*/\.\.(/|$)}{$1} ){}
+	$TOOLHOME =~ s{/$}{};
+	$PLUGINSDIR = "$TOOLHOME/plugins";
+	$CONFDIR = "$TOOLHOME/conf";
+	$LOGDIR = "$TOOLHOME/log";
+	$RUNDIR = "$TOOLHOME/run";
+}
+use lib "$TOOLHOME/lib/perl5";
+
+use strict;
+use JSON;
+use Time::Local;
+use Encode;
+use Carp::Always;
+use Foucault::Common;
+use Foucault::Configuration;
+use Foucault::Filter;
+use Foucault::Monitor;
+use Foucault::WellKnown;
+use Foucault::Diagnosis;
+
+our $JSON_CODEC        = JSON->new;
+our $JSON_CODEC_PRETTY = JSON->new->pretty->canonical;
+
+####
+
+our $UTF8_CODEC;
+sub utf8safe ($) {
+	my ($text) = @_;
+	$UTF8_CODEC = find_encoding "utf-8" unless defined $UTF8_CODEC;
+	eval {
+		my $tmp = $text;
+		my $utf8 = $UTF8_CODEC->decode($tmp, 1);
+	};
+	if( $@ ){
+		s{[\x80-\xff]}{'$'.uc(unpack('H2',$&))}eg;
+	}
+	return $text;
+}
+
+####
+
+sub cleanup_dir ($) {
+	my ($dir) = @_;
+	opendir my $d, $dir or do {
+		die "$dir: cannot open, stopped";
+	};
+	my @f;
+	while( my $e = readdir $d ){
+		next if $e =~ m"^\.";
+		next unless -f "$dir/$e";
+		push @f, $e;
+	}
+	close $d;
+	foreach my $e (@f){ unlink "$dir/$e"; }
+}
+
+sub listup_dir ($) {
+	my ($dir) = @_;
+	opendir my $d, $dir or do {
+		die "$dir: cannot open, stopped";
+	};
+	my @f;
+	while( my $e = readdir $d ){
+		next if $e =~ m"^\.";
+		next unless -f "$dir/$e";
+		push @f, $e;
+	}
+	close $d;
+	return @f;
+}
+
+#### Sub Commands
+
+sub subcmd_create_statsdir ($) {
+	my ($dir) = @_;
+	mkdir "$dir";
+	mkdir "$dir/source";
+	mkdir "$dir/1_concatination_setting";
+	mkdir "$dir/1-1_collection_by_tag";
+	mkdir "$dir/1-2_concatinated_messages";
+	mkdir "$dir/1-3_buffered_messages";
+	mkdir "$dir/2_monitoring_setting";
+	mkdir "$dir/2-1_collection_by_pattern";
+	mkdir "$dir/2-2_unmonitored_messages";
+	mkdir "$dir/3_detection_setting";
+	mkdir "$dir/3-1_detected_anomalies";
+	mkdir "$dir/3-2_detected_events";
+	mkdir "$dir/3-3_redirected_messages";
+	mkdir "$dir/4_classification_setting";
+	mkdir "$dir/4-1_generalized";
+	mkdir "$dir/5_tabulation_setting";
+	mkdir "$dir/5-1_grouped_events";
+	mkdir "$dir/5-2_grouped_generalized";
+	mkdir "$dir/5-3_cross_tables";
+	mkdir "$dir/5-4_classified_by_equivalence";
+
+	system "cp \"$CONFDIR/concatfilter.conf\"    \"$dir/1_concatination_setting\"";
+	system "cp \"$CONFDIR/anomalymonitor.conf\"  \"$dir/2_monitoring_setting\"";
+	system "cp \"$CONFDIR/wellknowns/\"*.regexp  \"$dir/3_detection_setting\"";
+	system "cp \"$CONFDIR/wellknowns/\"*.rules   \"$dir/4_classification_setting\"";
+	system "cp \"$CONFDIR/report.conf\"          \"$dir/5_tabulation_setting\"";
+}
+
+sub subcmd_cleanup_statsdir ($) {
+	my ($dir) = @_;
+	cleanup_dir "$dir/1-1_collection_by_tag";
+	cleanup_dir "$dir/1-2_concatinated_messages";
+	cleanup_dir "$dir/1-3_buffered_messages";
+	cleanup_dir "$dir/2-1_collection_by_pattern";
+	cleanup_dir "$dir/2-2_unmonitored_messages";
+	cleanup_dir "$dir/3-1_detected_anomalies";
+	cleanup_dir "$dir/3-2_detected_events";
+	cleanup_dir "$dir/3-3_redirected_messages";
+	cleanup_dir "$dir/4-1_generalized";
+	cleanup_dir "$dir/5-1_grouped_events";
+	cleanup_dir "$dir/5-2_grouped_generalized";
+	cleanup_dir "$dir/5-3_cross_tables";
+	cleanup_dir "$dir/5-4_classified_by_equivalence";
+}
+
+sub subcmd_sort_by_tag ($$) {
+	my ($inputdir, $outputdir) = @_;
+	print "sorting by tag.";
+	my %out_fh;
+	my @list = listup_dir $inputdir;
+	foreach my $f ( @list ){
+		print ".";
+		open my $in_fh, "<", "$inputdir/$f" or die;
+		while( my $in = <$in_fh> ){
+			next if $in =~ m"^\s*$";
+			my %in_hash = json2hash $in;
+			my $tag = $in_hash{tag};
+
+			my $out_fh = $out_fh{$tag};
+			unless( defined $out_fh ){
+				open $out_fh, ">>", "$outputdir/$tag.ndjson" or die;
+				$out_fh{$tag} = $out_fh;
+			}
+			print $out_fh $in;
+		}
+		close $in_fh;
+	}
+	while( my ($f, $out_fh) = each %out_fh ){
+		close $out_fh;
+	}
+	print "done.\n";
+}
+
+sub subcmd_concat ($$$$) {
+	my ($confdir, $inputdir, $outputdir, $buffereddir) = @_;
+	print "concatinating.";
+	my $conffile = "$confdir/concatfilter.conf";
+	my $conf   = Foucault::Configuration->new;
+	my $filter = Foucault::Filter->new;
+
+	my %buffer;
+	$conf->read_concatfilter_conf( $conffile );
+	my @rules = $conf->get_concatfilter_rules;
+	$filter->set_concatbuffer( \%buffer );
+        $filter->set_concatfilter_rules( @rules );
+
+	my @list = listup_dir $inputdir;
+	foreach my $f ( @list ){
+		print ".";
+		next unless $f =~ m"^(.+)\.ndjson$";
+		my $tag = $1;
+		open my $in_fh,  "<",  "$inputdir/$f"  or die;
+		open my $out_fh, ">>", "$outputdir/$f" or die;
+		while( my $in = <$in_fh> ){
+			next if $in =~ m"^\s*$";
+			my %in_hash   = json2hash $in;
+			my $tag       = $in_hash{tag};
+			my $messages  = [$in_hash{message}];
+			my $cmessages = [];
+			$filter->passthrough_concatfilter( $tag, $messages, $cmessages );
+			foreach my $cmessage ( @$cmessages ){
+				my %out_hash = ( %in_hash, 'message' => $cmessage );
+				my $out_json = hash2json %out_hash;
+				utf8::encode($out_json);
+				print $out_fh "$out_json\n";
+			}
+		}
+		close $in_fh;
+		close $out_fh;
+	}
+	while( my ($tag, $bufferunit) = each %buffer ){
+		open my $out_fh, ">>", "$buffereddir/$tag.ndjson" or die;
+		my $fracture = $$bufferunit{fracture};
+		foreach my $message ( @$fracture ){
+			my %out_hash = ( 'tag' => $tag, 'message' => $message );
+			my $out_json = hash2json %out_hash;
+			utf8::encode($out_json);
+			print $out_fh "$out_json\n";
+		}
+		close $out_fh;
+	}
+	print "done.\n";
+}
+
+sub subcmd_sort_by_pattern ($$$$) {
+	my ($confdir, $inputdir, $outputdir, $unmonitoreddir) = @_;
+	print "sorting by pattern.";
+	my $conffile = "$confdir/anomalymonitor.conf";
+	my $conf     = Foucault::Configuration->new;
+	my $monitor  = Foucault::Monitor->new;
+
+	$conf->read_anomalymonitor_conf( $conffile );
+	my @rules = $conf->get_anomalymonitor_rules;
+	$monitor->set_anomalymonitor_rules( @rules );
+
+	my %out_fh;
+	my @list = listup_dir $inputdir;
+	foreach my $f ( @list ){
+		print ".";
+		next unless $f =~ m"^(.+)\.ndjson$";
+		my $tag = $1;
+		open my $in_fh,          "<",  "$inputdir/$f" or die;
+		open my $unmonitored_fh, ">>", "$unmonitoreddir/$f" or die;
+		while( my $in = <$in_fh> ){
+			next if $in =~ m"^\s*$";
+			my %in_hash   = json2hash $in;
+			my $tag       = $in_hash{tag};
+
+			my ($name, $pattern, $pattern_regexp, $redirects, $captures_from_tag) = $monitor->get_anomalymonitor_rule($tag);
+
+			if( $pattern eq "" ){
+				print $unmonitored_fh $in;
+			}else{
+				my $out_fh = $out_fh{$pattern};
+				unless( defined $out_fh ){
+					open $out_fh, ">>", "$outputdir/$pattern.ndjson" or die;
+					$out_fh{$pattern} = $out_fh;
+				}
+				print $out_fh $in;
+			}
+		}
+		close $in_fh;
+		close $unmonitored_fh;
+	}
+	while( my ($f, $out_fh) = each %out_fh ){
+		close $out_fh;
+	}
+	print "done.\n";
+}
+
+sub subcmd_detect ($$$$$$) {
+	my ($confdir, $wellknowndir, $inputdir, $anomalydir, $eventdir, $redirecteddir) = @_;
+	print "detecting.";
+	my $conffile = "$confdir/anomalymonitor.conf";
+	my $conf     = Foucault::Configuration->new;
+	my $monitor  = Foucault::Monitor->new;
+
+	$conf->read_anomalymonitor_conf( $conffile, $wellknowndir );
+	my @rules = $conf->get_anomalymonitor_rules;
+	$monitor->set_anomalymonitor_rules( @rules );
+
+	my @list = listup_dir $inputdir;
+	foreach my $f ( @list ){
+		print ".";
+		next unless $f =~ m"^(.+)\.ndjson$";
+		my $pattern = $1;
+		open my $in_fh,         "<",  "$inputdir/$f" or die;
+		open my $anomaly_fh,    ">>", "$anomalydir/$f" or die;
+		open my $event_fh,      ">>", "$eventdir/$f" or die;
+		open my $redirected_fh, ">>", "$redirecteddir/$f" or die;
+		while( my $in = <$in_fh> ){
+			next if $in =~ m"^\s*$";
+			my %in_hash       = json2hash $in;
+			my $tag           = $in_hash{tag};
+			my $message       = $in_hash{message};
+			my $redirected_tag2cmessages = {};
+			my $events        = [];
+			my $unmonitored   = [];
+
+			$monitor->monitor_anomaly($tag, [$message], $redirected_tag2cmessages, $events, $unmonitored);
+
+			die if @$unmonitored;
+
+			unless( @$events ){
+				# wellknown
+				print $anomaly_fh "\n";
+				print $event_fh   "\n";
+			}else{
+				foreach my $event ( @$events ){
+					my $event_json = hash2json %$event;
+					utf8::encode($event_json);
+					if( $$event{event} =~ m"ANOMALY" ){
+						print $anomaly_fh "$event_json\n";
+						print $event_fh   "\n";
+					}else{
+						print $anomaly_fh "\n";
+						print $event_fh   "$event_json\n";
+					}
+				}
+			}
+			while( my ($tag, $cmessages) = each %$redirected_tag2cmessages ){
+				foreach my $cmessage ( @$cmessages ){
+					my %redirected_hash = ( %in_hash, 'tag' => $tag, 'message' => $cmessage );
+					my $redirected_json = hash2json %redirected_hash;
+					utf8::encode($redirected_json);
+					print $redirected_fh "$redirected_json\n";
+				}
+			}
+		}
+		close $in_fh;
+	}
+	print "done.\n";
+}
+
+sub subcmd_classify ($$$) {
+	my ($confdir, $inputdir, $outputdir) = @_;
+	print "classifing.";
+	my $wellknown = Foucault::WellKnown->new;
+	$wellknown->set_wellknowndir( $confdir );
+
+	my @list = listup_dir $inputdir;
+	foreach my $f ( @list ){
+		print ".";
+		next unless $f =~ m"^(.+)\.ndjson$";
+		my $pattern = $1;
+		$wellknown->read_rulefile( $pattern );
+
+		open my $in_fh,  "<",  "$inputdir/$f" or die;
+		open my $out_fh, ">>", "$outputdir/$f" or die;
+		while( my $in = <$in_fh> ){
+			if( $in =~ m"^\s*$" ){
+				print $out_fh "\n";
+				next;
+			}
+
+			my %in_hash = json2hash $in;
+			my $message = $in_hash{message};
+			my $generalized = $wellknown->generalize( $pattern, $message );
+
+			my %out_hash = ( %in_hash, 'generalized' => $generalized );
+			my $out_json = hash2json %out_hash;
+			utf8::encode($out_json);
+			print $out_fh "$out_json\n";
+			
+		}
+		close $in_fh;
+		close $out_fh;
+	}
+
+	print "done.\n";
+}
+
+sub subcmd_sort_events ($$$) {
+	my ($confdir, $inputdir, $outputdir) = @_;
+	print "sorting events.";
+	my $conffile = "$confdir/report.conf";
+	my $conf      = Foucault::Configuration->new;
+	my $diagnosis = Foucault::Diagnosis->new;
+	$conf->read_report_conf( $conffile );
+	my $rules = $conf->get_report_rules;
+	$diagnosis->set_report_rules($rules);
+
+	my %out_fh;
+	my @list = listup_dir $inputdir;
+	foreach my $f ( @list ){
+		print ".";
+		next unless $f =~ m"^(.+)\.ndjson$";
+		my $pattern = $1;
+
+		open my $in_fh,  "<",  "$inputdir/$f" or die;
+		while( my $in = <$in_fh> ){
+			next if $in =~ m"^\s*$";
+
+			my %in_hash     = json2hash $in;
+			my @eventgroups = $diagnosis->get_eventgroupnames_of( \%in_hash );
+			foreach my $eventgroup ( @eventgroups ){
+				my $out_fh = $out_fh{$eventgroup};
+				unless( defined $out_fh ){
+					open $out_fh, ">>", "$outputdir/$eventgroup.ndjson" or die;
+					$out_fh{$eventgroup} = $out_fh;
+				}
+				print $out_fh $in;
+			}
+		}
+		close $in_fh;
+	}
+
+	while( my ($f, $out_fh) = each %out_fh ){
+		close $out_fh;
+	}
+	print "done.\n";
+}
+
+sub subcmd_sort_anomalies ($$$) {
+	my ($confdir, $inputdir, $outputdir) = @_;
+	print "sorting anomalies.";
+	my $conffile = "$confdir/report.conf";
+	my $conf      = Foucault::Configuration->new;
+	my $diagnosis = Foucault::Diagnosis->new;
+	$conf->read_report_conf( $conffile );
+	my $rules = $conf->get_report_rules;
+	$diagnosis->set_report_rules($rules);
+
+	my %out_fh;
+	my @list = listup_dir $inputdir;
+	foreach my $f ( @list ){
+		print ".";
+		next unless $f =~ m"^(.+)\.ndjson$";
+		my $pattern = $1;
+
+		open my $in_fh,  "<",  "$inputdir/$f" or die;
+		while( my $in = <$in_fh> ){
+			next if $in =~ m"^\s*$";
+
+			my %in_hash     = json2hash $in;
+			my @eventgroups = $diagnosis->get_eventgroupnames_of( \%in_hash );
+			foreach my $eventgroup ( @eventgroups ){
+				my $out_fh = $out_fh{$eventgroup};
+				unless( defined $out_fh ){
+					open $out_fh, ">>", "$outputdir/$eventgroup.ndjson" or die;
+					$out_fh{$eventgroup} = $out_fh;
+				}
+				print $out_fh $in;
+			}
+		}
+		close $in_fh;
+	}
+
+	while( my ($f, $out_fh) = each %out_fh ){
+		close $out_fh;
+	}
+	print "done.\n";
+}
+
+sub subcmd_tabulate_events ($$$) {
+	my ($confdir, $inputdir, $outputdir) = @_;
+	print "tabulating events.";
+	my $conffile = "$confdir/report.conf";
+	my $conf      = Foucault::Configuration->new;
+	my $diagnosis = Foucault::Diagnosis->new;
+	$conf->read_report_conf( $conffile );
+	my $rules = $conf->get_report_rules;
+	$diagnosis->set_report_rules($rules);
+
+	my @list = listup_dir $inputdir;
+	foreach my $f ( @list ){
+		print ".";
+		next unless $f =~ m"^(.+)\.ndjson$";
+		my $eventgroup = $1;
+
+		my $total;
+		my %subtotal_by_tag;
+		my %subtotal_by_event;
+		my %cross_tag_event;
+		my %cross_attrname_attrvalue;
+
+		open my $in_fh,  "<",  "$inputdir/$f" or die;
+		while( my $in = <$in_fh> ){
+			next if $in =~ m"^\s*$";
+
+			my %in_hash = json2hash $in;
+			my $tag   = $in_hash{tag};
+			my $event = $in_hash{event};
+
+			$total++;
+			$subtotal_by_tag  {$tag}++;
+			$subtotal_by_event{$event}++;
+			$cross_tag_event{$tag}->{$event}++;
+
+			my %attrs   = $diagnosis->get_attributes_of( \%in_hash );
+			while( my ($k, $v) = each %attrs ){
+				$cross_attrname_attrvalue{$k}->{$v}++;
+			}
+		}
+		close $in_fh;
+
+		my $json = $JSON_CODEC_PRETTY->encode( {
+			total		         => $total,
+			subtotal_by_tag	         => \%subtotal_by_tag,
+			subtotal_by_event 	 => \%subtotal_by_event,
+			cross_tag_event          => \%cross_tag_event,
+			cross_attrname_attrvalue => \%cross_attrname_attrvalue,
+		} );
+		open my $out_fh,  ">", "$outputdir/$eventgroup.json" or die;
+		print $out_fh "$json\n";
+		close $out_fh;
+	}
+
+	print "done.\n";
+}
+
+sub subcmd_tabulate_anomalies ($$$) {
+	my ($confdir, $inputdir, $outputdir) = @_;
+	print "tabulating anomalies.";
+	my $conffile = "$confdir/report.conf";
+	my $conf      = Foucault::Configuration->new;
+	my $diagnosis = Foucault::Diagnosis->new;
+	$conf->read_report_conf( $conffile );
+	my $rules = $conf->get_report_rules;
+	$diagnosis->set_report_rules($rules);
+
+	my @list = listup_dir $inputdir;
+	foreach my $f ( @list ){
+		print ".";
+		next unless $f =~ m"^(.+)\.ndjson$";
+		my $eventgroup = $1;
+
+		my %pattern2generalized2info;
+		my @infos; 
+		open my $in_fh,  "<",  "$inputdir/$f" or die;
+		while( my $in = <$in_fh> ){
+			next if $in =~ m"^\s*$";
+
+			my %in_hash = json2hash $in;
+			my $pattern     = $in_hash{pattern};
+			my $message     = $in_hash{message};
+			my $generalized = $in_hash{generalized};
+			my $tag         = $in_hash{tag};
+
+			my $info = $pattern2generalized2info{$pattern}->{$generalized};
+			unless( defined $info ){
+				$info = {
+					"tag"         => $tag,
+					"message"     => $message,
+					"pattern"     => $pattern,
+					"generalized" => $generalized,
+					"times"       => 0,
+				};
+				$pattern2generalized2info{$pattern}->{$generalized} = $info;
+				push @infos, $info;
+			}
+			$$info{times}++;
+
+		}
+		close $in_fh;
+
+		my @ranking = sort { $$b{times} <=> $$a{times} || $$a{generalized} cmp $$b{generalized} } @infos;
+		my $json = $JSON_CODEC_PRETTY->encode( \@ranking );
+		utf8::encode($json);
+		open my $out_fh,  ">", "$outputdir/$eventgroup.json" or die;
+		print $out_fh "$json\n";
+		close $out_fh;
+	}
+
+	print "done.\n";
+}
+
+sub subcmd_build_statsdir ($) {
+	my ($dir) = @_;
+	subcmd_sort_by_tag
+		"$dir/source",
+		"$dir/1-1_collection_by_tag";
+	subcmd_concat
+		"$dir/1_concatination_setting",
+		"$dir/1-1_collection_by_tag",
+		"$dir/1-2_concatinated_messages",
+		"$dir/1-3_buffered_messages";
+	subcmd_sort_by_pattern
+		"$dir/2_monitoring_setting",
+		"$dir/1-2_concatinated_messages",
+		"$dir/2-1_collection_by_pattern",
+		"$dir/2-2_unmonitored_messages";
+	subcmd_detect
+		"$dir/2_monitoring_setting",
+		"$dir/3_detection_setting",
+		"$dir/2-1_collection_by_pattern",
+		"$dir/3-1_detected_anomalies",
+		"$dir/3-2_detected_events",
+		"$dir/3-3_redirected_messages";
+	subcmd_classify
+		"$dir/4_classification_setting",
+		"$dir/3-1_detected_anomalies",
+		"$dir/4-1_generalized";
+	subcmd_sort_events
+		"$dir/5_tabulation_setting",
+		"$dir/3-2_detected_events",
+		"$dir/5-1_grouped_events";
+	subcmd_sort_anomalies
+		"$dir/5_tabulation_setting",
+		"$dir/4-1_generalized",
+		"$dir/5-2_grouped_generalized";
+	subcmd_tabulate_events
+		"$dir/5_tabulation_setting",
+		"$dir/5-1_grouped_events",
+		"$dir/5-3_cross_tables";
+	subcmd_tabulate_anomalies
+		"$dir/5_tabulation_setting",
+		"$dir/5-2_grouped_generalized",
+		"$dir/5-4_classified_by_equivalence";
+}
+
+STDOUT->autoflush(1);
+if    ( $ARGV[0] eq 'create' ){
+	subcmd_create_statsdir $ARGV[1];
+
+}elsif( $ARGV[0] eq 'cleanup' ){
+	subcmd_cleanup_statsdir $ARGV[1];
+
+}elsif( $ARGV[0] eq 'build' ){
+	subcmd_build_statsdir $ARGV[1];
+
+}else{
+	print	"usage: % $0 ACTION\n",
+		"\n",
+		"    ACTION\n",
+		"	create DIR\n",
+		"	cleanup DIR\n",
+		"	build DIR\n",
+		"\n";
+	exit 0;
+}
+
+exit 0;
+
