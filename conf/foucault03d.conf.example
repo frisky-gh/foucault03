@@ -1,15 +1,15 @@
 
 listen_address=0.0.0.0
 listen_port=46847
-daemon_user=-
+daemon_user=daemon
 allow=0.0.0.0/0
 logfile=/opt/foucault03/log/foucault03d.log.%y-%m-%d
 pidfile=/opt/foucault03/run/foucault03d.pid
-anomalydetectfile=/opt/foucault03/detect/anomaly.%y-%m-%d
-trafficdetectfile=/opt/foucault03/detect/traffic.%y-%m-%d
-wellknowndir=/opt/foucault03/conf/wellknowns
+anomalydetectfile=/opt/foucault03/log/anomaly.%y-%m-%d
+trafficdetectfile=/opt/foucault03/log/traffic.%y-%m-%d
+wellknowndir=/opt/foucault03/conf
 concatdir=/opt/foucault03/status
-trafficdir=/opt/foucault03/traffic
+trafficdir=/opt/foucault03/status
 
 TRACE=0
 INFO=1

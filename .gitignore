@@ -37,15 +37,9 @@ inc/
 /src/
 /log/*
 /status/*
-/tmp/*
 /spool/*
-/anomalylog/*
-/apicalllog/*
-/capturedlog/*
-/throttlinglog/*
-/unmonitoredlog/*
-/deliveredevent/*
-/undeliveredevent/*
+/run/*
+/tmp/*
 /conf/*.conf
 /conf/*.tt
 /conf/*.rules
