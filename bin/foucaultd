@@ -110,24 +110,6 @@ sub set_child_periodic_handler ($$) {
 
 ## Web API action functions
 
-sub add_events_to_transactions ($$$) {
-	my ($trxid2times, $events, $unmonitored) = @_;
-	foreach my $i ( @$events ){
-		#my $tag     = $$i{tag};
-		my $pattern = $$i{pattern};
-		my $event   = $$i{event};
-		$$trxid2times{"anomaly.all"}++;
-		#$$trxid2times{"anomaly.by_tag.$tag"}++;
-		$$trxid2times{"anomaly.by_pattern.$pattern"}++;
-		$$trxid2times{"anomaly.by_event.$event"}++;
-	}
-	foreach my $i ( @$unmonitored ){
-		#my $tag     = $$i{tag};
-		$$trxid2times{"unmonitored.all"}++;
-		#$$trxid2times{"unmonitored.by_tag.$tag"}++;
-	}
-}
-
 sub monitor_content ($) {
 	my ($content) = @_;
 
@@ -151,8 +133,7 @@ sub monitor_content ($) {
 	$RUNTIME->write_unmonitored_messages   ( $unmonitored );
 
 	$RUNTIME->tracelog("[STEP] processing transaction filters...");
-	$RUNTIME->passthrough_all_transactionfilters( $rmessages, $trxid2times );
-	add_events_to_transactions $trxid2times, $events, $unmonitored;
+	$RUNTIME->passthrough_all_transactionfilters( $rmessages, $events, $unmonitored, $trxid2times );
 
 	$RUNTIME->tracelog("[STEP] counting transactions...");
 	$RUNTIME->add_transactions( $trxid2times );
@@ -192,7 +173,7 @@ sub action_debug ($$) {
 
 sub action_alive ($) {
 	my ($conn) = @_;
-	my $encoder = JSON::XS->new->pretty(1)->indent(4)->space_after(1);
+	my $encoder = JSON::XS->new->pretty(1)->indent(4)->space_after(1)->canonical(1);
 	my $res = HTTP::Response->new;
 	$res->code(200);
 	$res->header('Content-Type' => 'text/plain');
@@ -205,11 +186,21 @@ sub action_alive ($) {
 sub action_status_traffic_volume ($) {
 	my ($conn) = @_;
 	my $traffic_volume = $$RUNTIME{traffic_volume};
-	my $encoder = JSON::XS->new->pretty(1)->indent(4)->space_after(1);
+	my $encoder = JSON::XS->new->pretty(1)->indent(4)->space_after(1)->canonical(1);
 	my $res = HTTP::Response->new;
 	$res->code(200);
 	$res->header('Content-Type' => 'text/plain');
 	$res->content( $encoder->encode($$traffic_volume{TIMESPAN2VOLUME}) );
+	$conn->send_response($res);
+}
+
+sub action_status_cache_stats ($) {
+	my ($conn) = @_;
+	my $encoder = JSON::XS->new->pretty(1)->indent(4)->space_after(1)->canonical(1);
+	my $res = HTTP::Response->new;
+	$res->code(200);
+	$res->header('Content-Type' => 'text/plain');
+	$res->content(  $encoder->encode( {$RUNTIME->take_statistics_of_cache} )  );
 	$conn->send_response($res);
 }
 
@@ -305,13 +296,15 @@ sub keep_child_daemon ($) {
 			action_monitor $conn, $content;
 		}elsif( $path =~ m"^/debug/" ){
 			action_debug   $conn, $content;
-		}elsif( $path =~ m"^/status/(alive|timeline|traffic_volume|traffic_status|rulecaches)(/.*)$" ){
+		}elsif( $path =~ m"^/status/(alive|timeline|traffic_volume|cache_stats|traffic_status|rulecaches)(/.*)$" ){
 			if    ( $1 eq 'alive' ){
 				action_alive              $conn;
 			}elsif( $1 eq 'timeline' ){
 				action_status_timeline    $conn;
 			}elsif( $1 eq 'traffic_volume' ){
 				action_status_traffic_volume $conn;
+			}elsif( $1 eq 'cache_stats' ){
+				action_status_cache_stats    $conn;
 			}elsif( $1 eq 'traffic_status' ){
 				action_status_traffic_status $conn;
 			}elsif( $1 eq 'rulecaches' ){

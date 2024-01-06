@@ -8,11 +8,13 @@ use Socket;
 use IO::Handle;
 
 use Foucault::Common;
+use Foucault::WellKnown;
 
 ####
 
 sub new ($$) {
 	my ($class, $toolhome) = @_;
+	$toolhome = "." unless defined $toolhome;
 	return bless {
 		'TOOLHOME' => $toolhome,
 
@@ -26,7 +28,8 @@ sub new ($$) {
 		'ANOMALYMONITOR_CONF'    => {},
 		'CONCATFILTER_CONF'      => {},
 		'TRAFFICMONITOR_CONF'    => {},
-		'TRANSACTIONFILTER_CONF' => {},
+		'transactionfilter_message_rules' => {},
+		'transactionfilter_event_rules'   => {},
 		'trafficmonitor_timespans' => [],
 		'trafficmonitor_viewpoints' => [],
 
@@ -145,6 +148,7 @@ sub read_foucault03d_conf_as_reload ($) {
 		'trafficdir'     => undef,
 		'concatdir'      => undef,
 		'pidfile'        => undef,
+		'wellknowndir'   => undef,
 	);
 
 	while( my ($k, $v) = each %backup_conf ){
@@ -193,12 +197,10 @@ sub read_concatfilter_conf ($;$) {
 	return 1;
 }
 
-sub read_anomalymonitor_conf ($;$$) {
-	my ($this, $conffile, $wellknowndir) = @_;
+sub read_anomalymonitor_conf ($;$) {
+	my ($this, $conffile) = @_;
 	$$this{anomalymonitor_conf_path} = $conffile if     defined $conffile;
 	$conffile = $$this{anomalymonitor_conf_path} unless defined $conffile;
-	$$this{FOUCAULT03D_CONF}->{wellknowndir} = $wellknowndir if     defined $wellknowndir;
-	$wellknowndir = $$this{FOUCAULT03D_CONF}->{wellknowndir} unless defined $wellknowndir;
 
 	my @conf;
 	my $rule;
@@ -213,9 +215,6 @@ sub read_anomalymonitor_conf ($;$$) {
 				'name'           => "$conffile:$.",
 				'targets'        => undef,
 				'pattern'        => undef,
-				'pattern_file'   => undef,
-				'pattern_mtime'  => undef,
-				'pattern_regexp' => undef,
 				'redirects'      => undef,
 			};
 			push @conf, $rule;
@@ -225,19 +224,7 @@ sub read_anomalymonitor_conf ($;$$) {
 			if( $@ ){ die "$conffile:$.: $@, stopped"; }
 			push @{$$rule{targets}}, $re;
 		}elsif( m"^\s*pattern\s+(\S.*)$" ){
-			my $f = "$wellknowndir/$1.regexp";
 			$$rule{pattern}      = $1;
-			$$rule{pattern_file} = $f;
-			my ($regexp, $mtime) = $this->read_regexpfile( $f );
-			unless( defined $regexp ){
-				$this->errorlog("$conffile:$.:$f: cannot open.");
-				$$rule{pattern_mtime} = undef;
-				$$rule{pattern_regexp} = undef;
-				next;
-			}
-			$$rule{pattern_mtime}  = $mtime;
-			$$rule{pattern_regexp} = $regexp;
-			$this->infolog("read_anomalymonitor_conf: $f: loaded.");
 		}elsif( m"^\s*redirect\s+(\S.*)$" ){
 			$redirect = {
 				'name'    => "$conffile:$.",
@@ -276,33 +263,59 @@ sub read_transactionfilter_conf ($;$) {
 	my ($this, $conffile) = @_;
 	$$this{transactionfilter_conf_path} = $conffile if     defined $conffile;
 	$conffile = $$this{transactionfilter_conf_path} unless defined $conffile;
-	my @conf;
+	my @message_rules;
+	my @event_rules;
 	my $rule;
 	open my $h, '<', $conffile or do {
 		die "cannot open $conffile: $OS_ERROR, stopped";
 	};
 	while (<$h>) {
 		next if m"^\s*(#|$)";
-		if    ( m"^\s*transaction_rule\s*$" ){
-			$rule = { 'name' => "$conffile:$." };
-			push @conf, $rule;
-		}elsif( m"^\s*input\s+(\S.*)$" ){
+		if    ( m"^\s*(transaction_rule|transaction_rule_for_message)\s*$" ){
+			$rule = {
+				'name' => "$conffile:$.",
+				'input_if_tag_matches'     => [],
+				'input_if_message_matches' => [],
+			};
+			push @message_rules, $rule;
+
+		}elsif( m"^\s*transaction_rule_for_event\s*$" ){
+			$rule = {
+				'name' => "$conffile:$.",
+				'input_if_tag_matches'     => [],
+				'input_if_message_matches' => [],
+				'input_if_event_matches'   => [],
+				'input_if_pattern_matches' => [],
+			};
+			push @event_rules, $rule;
+
+		}elsif( m"^\s*(input|tag_pattern|input_if_tag_matches)\s+(\S.*)$" ){
+			my $re;
+			eval { $re = qr"^($2)$"; };
+			if( $@ ){ die "$conffile:$.: $@, stopped"; }
+			push @{$$rule{input_if_tag_matches}}, $re;
+
+		}elsif( m"^\s*(message_pattern|input_if_message_matches)\s+(\S.*)$" ){
+			my $re;
+			eval { $re = qr"^($2)$"; };
+			if( $@ ){ die "$conffile:$.: $@, stopped"; }
+			push @{$$rule{input_if_message_matches}}, $re;
+
+		}elsif( m"^\s*input_if_event_matches\s+(\S.*)$" ){
 			my $re;
 			eval { $re = qr"^($1)$"; };
 			if( $@ ){ die "$conffile:$.: $@, stopped"; }
-			push @{$$rule{inputs}}, $re;
+			push @{$$rule{input_if_event_matches}}, $re;
+
+		}elsif( m"^\s*input_if_pattern_matches\s+(\S.*)$" ){
+			my $re;
+			eval { $re = qr"^($1)$"; };
+			if( $@ ){ die "$conffile:$.: $@, stopped"; }
+			push @{$$rule{input_if_pattern_matches}}, $re;
+
 		}elsif( m"^\s*output\s+(\S.*)$" ){
 			$$rule{output} = $1;
-		}elsif( m"^\s*tag_pattern\s+(\S.*)$" ){
-			my $re;
-			eval { $re = qr"^($1)$"; };
-			if( $@ ){ die "$conffile:$.: $@, stopped"; }
-			push @{$$rule{tag_patterns}}, $re;
-		}elsif( m"^\s*message_pattern\s+(\S.*)$" ){
-			my $re;
-			eval { $re = qr"^($1)$"; };
-			if( $@ ){ die "$conffile:$.: $@, stopped"; }
-			push @{$$rule{message_patterns}}, $re;
+
 		}else{
 			$this->errorlog("$conffile:$.: illegal format, ignored.");
 		}
@@ -310,7 +323,8 @@ sub read_transactionfilter_conf ($;$) {
 	close $h or do {
 		die "close failed for $conffile: $OS_ERROR, stopped";
 	};
-	$$this{TRANSACTIONFILTER_CONF} = \@conf;
+	$$this{transactionfilter_message_rules} = \@message_rules;
+	$$this{transactionfilter_event_rules}   = \@event_rules;
 	return 1;
 }
 
@@ -511,6 +525,15 @@ sub get_anomalymonitor_rules ($) {
 	return @{ $$this{ANOMALYMONITOR_CONF} };
 }
 
+sub get_anomalymonitor_patterns ($) {
+	my ($this) = @_;
+	my %r;
+	foreach my $rule ( @{ $$this{ANOMALYMONITOR_CONF} } ){
+		$r{ $$rule{pattern} } = 1;
+	}
+	return sort keys %r;
+}
+
 sub get_concatfilter_rules ($) {
 	my ($this) = @_;
 	return @{ $$this{CONCATFILTER_CONF} };
@@ -518,7 +541,10 @@ sub get_concatfilter_rules ($) {
 
 sub get_transactionfilter_rules ($) {
 	my ($this) = @_;
-	return @{ $$this{TRANSACTIONFILTER_CONF} };
+	return (
+		'message_rules' => $$this{transactionfilter_message_rules},
+		'event_rules'   => $$this{transactionfilter_event_rules},
+	);
 }
 
 sub get_trafficmonitor_viewpoints ($) {
@@ -600,6 +626,36 @@ sub get_path_of_concatdir ($) {
 	return $$this{FOUCAULT03D_CONF}->{concatdir};
 }
 
+sub get_path_of_wellknowndir ($) {
+	my ($this) = @_;
+	return $$this{FOUCAULT03D_CONF}->{wellknowndir};
+}
+
+sub get_path_of_concatfilter_conf ($) {
+	my ($this) = @_;
+	return $$this{concatfilter_conf_path};
+}
+
+sub get_path_of_transactionfilter_conf ($) {
+	my ($this) = @_;
+	return $$this{transactionfilter_conf_path};
+}
+
+sub get_path_of_anomalymonitor_conf ($) {
+	my ($this) = @_;
+	return $$this{anomalymonitor_conf_path};
+}
+
+sub get_path_of_trafficmonitor_conf ($) {
+	my ($this) = @_;
+	return $$this{trafficmonitor_conf_path};
+}
+
+sub get_path_of_report_conf ($) {
+	my ($this) = @_;
+	return $$this{report_conf_path};
+}
+
 sub get_daemon_listen_addrport ($) {
 	my ($this) = @_;
 	return $$this{FOUCAULT03D_CONF}->{listen_address}, $$this{FOUCAULT03D_CONF}->{listen_port};
@@ -612,19 +668,10 @@ sub get_daemon_user ($) {
 
 ####
 
-sub reset_cache ($) {
-	my ($this) = @_;
-	$$this{anomalymonitor_rulecache}    => {},
-	$$this{concatfilter_rulecache}      => {},
-	$$this{trafficmonitor_rulecache}    => {},
-	$$this{tracsactionfilter_rulecache} => {},
-}
-
 sub reload ($) {
 	my ($this) = @_;
 
 	$this->read_foucault03d_conf_as_reload;
-	$this->reset_cache;
 	$this->read_concatfilter_conf;
 	$this->read_anomalymonitor_conf;
 	$this->read_transactionfilter_conf;

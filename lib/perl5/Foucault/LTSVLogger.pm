@@ -11,7 +11,7 @@ use Foucault::Common;
 sub new ($$) {
 	my ($class, $path_pattern) = @_;
 
-	my $path = expand_path $path_pattern;
+	my $path = expand_time_placeholders $path_pattern;
 	open my $fh, ">>", $path or die;
 	$fh->autoflush;
 	my %r = (
@@ -30,7 +30,7 @@ sub refresh ($) {
 	my $last_path = $$this{PATH};
 	my $last_fh   = $$this{FH};
 
-	my $path = expand_path $$this{PATH_PATTERN};
+	my $path = expand_time_placeholders $$this{PATH_PATTERN};
 	unless( $last_path eq $path ){
 		close $last_fh if defined $last_fh;
 		open my $fh, ">>", $path or die;

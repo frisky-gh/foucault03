@@ -81,7 +81,9 @@ sub listup_dir ($) {
 sub subcmd_create_statsdir ($) {
 	my ($dir) = @_;
 	mkdir "$dir";
-	mkdir "$dir/source";
+	mkdir "$dir/sources";
+	mkdir "$dir/samples";
+	mkdir "$dir/additional_samples";
 	mkdir "$dir/1_concatination_setting";
 	mkdir "$dir/1-1_collection_by_tag";
 	mkdir "$dir/1-2_concatinated_messages";
@@ -101,11 +103,21 @@ sub subcmd_create_statsdir ($) {
 	mkdir "$dir/5-3_cross_tables";
 	mkdir "$dir/5-4_classified_by_equivalence";
 
-	system "cp \"$CONFDIR/concatfilter.conf\"    \"$dir/1_concatination_setting\"";
-	system "cp \"$CONFDIR/anomalymonitor.conf\"  \"$dir/2_monitoring_setting\"";
-	system "cp \"$CONFDIR/wellknowns/\"*.regexp  \"$dir/3_detection_setting\"";
-	system "cp \"$CONFDIR/wellknowns/\"*.rules   \"$dir/4_classification_setting\"";
-	system "cp \"$CONFDIR/report.conf\"          \"$dir/5_tabulation_setting\"";
+	my $conf = Foucault::Configuration->new( $TOOLHOME );
+	$conf->read_foucault03d_conf;
+	my $wellknowndir             = $conf->get_path_of_wellknowndir;
+	my $concatfilter_conf_path   = $conf->get_path_of_concatfilter_conf;
+	my $anomalymonitor_conf_path = $conf->get_path_of_anomalymonitor_conf;
+	my $report_conf_path         = $conf->get_path_of_report_conf;
+	system "cp \"$concatfilter_conf_path\"    \"$dir/1_concatination_setting\"";
+	system "cp \"$anomalymonitor_conf_path\"  \"$dir/2_monitoring_setting\"";
+	system "cp \"$report_conf_path\"          \"$dir/5_tabulation_setting\"";
+
+	$conf->read_anomalymonitor_conf;
+	my @patterns = $conf->get_anomalymonitor_patterns;
+	system "cp \"$wellknowndir/\"*.regexp     \"$dir/3_detection_setting\"";
+	system "cp \"$wellknowndir/\"*.rules      \"$dir/4_classification_setting\"";
+	system "cp \"$wellknowndir/\"*.samples    \"$dir/samples\"";
 }
 
 sub subcmd_cleanup_statsdir ($) {
@@ -123,6 +135,36 @@ sub subcmd_cleanup_statsdir ($) {
 	cleanup_dir "$dir/5-2_grouped_generalized";
 	cleanup_dir "$dir/5-3_cross_tables";
 	cleanup_dir "$dir/5-4_classified_by_equivalence";
+}
+
+sub subcmd_compile ($$$$$) {
+	my ($confdir, $rulesdir, $samplesdir, $additional_samplesdir, $regexpdir) = @_;
+	print "compiling.";
+	my $conffile  = "$confdir/anomalymonitor.conf";
+	my $conf      = Foucault::Configuration->new;
+	my $wellknown = Foucault::WellKnown->new;
+
+	$conf->read_anomalymonitor_conf( $conffile );
+	my @patterns = $conf->get_anomalymonitor_patterns;
+	foreach my $pattern ( @patterns ){
+		print ".";
+
+		$wellknown->set_path_of_wellknowndir    ( $regexpdir );
+		$wellknown->read_patternregexp_file_of  ( $pattern ) or die;
+		$wellknown->set_path_of_wellknowndir    ( $rulesdir );
+		$wellknown->read_generalizerules_file_of( $pattern ) or die;
+		$wellknown->set_path_of_wellknowndir    ( $samplesdir );
+		$wellknown->read_samples_file_of        ( $pattern ) or die;
+		$wellknown->set_path_of_wellknowndir    ( $additional_samplesdir );
+		$wellknown->read_samples_file_of        ( $pattern ) or die;
+
+		$wellknown->compile( $pattern );
+
+		$wellknown->set_path_of_wellknowndir    ( $regexpdir );
+		$wellknown->write_patternregexp_file_of ( $pattern );
+		$wellknown->write_diagnosis_file_of     ( $pattern );
+	}
+	print "done.\n";
 }
 
 sub subcmd_sort_by_tag ($$) {
@@ -207,13 +249,15 @@ sub subcmd_concat ($$$$) {
 sub subcmd_sort_by_pattern ($$$$) {
 	my ($confdir, $inputdir, $outputdir, $unmonitoreddir) = @_;
 	print "sorting by pattern.";
-	my $conffile = "$confdir/anomalymonitor.conf";
-	my $conf     = Foucault::Configuration->new;
-	my $monitor  = Foucault::Monitor->new;
+	my $conffile  = "$confdir/anomalymonitor.conf";
+	my $conf      = Foucault::Configuration->new;
+	my $monitor   = Foucault::Monitor->new;
+	my $wellknown = Foucault::WellKnown->new;
 
 	$conf->read_anomalymonitor_conf( $conffile );
 	my @rules = $conf->get_anomalymonitor_rules;
 	$monitor->set_anomalymonitor_rules( @rules );
+	$monitor->set_wellknown( $wellknown );
 
 	my %out_fh;
 	my @list = listup_dir $inputdir;
@@ -221,14 +265,15 @@ sub subcmd_sort_by_pattern ($$$$) {
 		print ".";
 		next unless $f =~ m"^(.+)\.ndjson$";
 		my $tag = $1;
+		my ($name, $pattern, $pattern_regexp, $redirects, $captures_from_tag) = $monitor->get_anomalymonitor_rule($tag);
 		open my $in_fh,          "<",  "$inputdir/$f" or die;
-		open my $unmonitored_fh, ">>", "$unmonitoreddir/$f" or die;
+		my $unmonitored_fh;
+		if( $pattern eq "" ){
+			open $unmonitored_fh, ">>", "$unmonitoreddir/$f" or die;
+		}
 		while( my $in = <$in_fh> ){
 			next if $in =~ m"^\s*$";
 			my %in_hash   = json2hash $in;
-			my $tag       = $in_hash{tag};
-
-			my ($name, $pattern, $pattern_regexp, $redirects, $captures_from_tag) = $monitor->get_anomalymonitor_rule($tag);
 
 			if( $pattern eq "" ){
 				print $unmonitored_fh $in;
@@ -242,7 +287,9 @@ sub subcmd_sort_by_pattern ($$$$) {
 			}
 		}
 		close $in_fh;
-		close $unmonitored_fh;
+		if( $pattern eq "" ){
+			close $unmonitored_fh;
+		}
 	}
 	while( my ($f, $out_fh) = each %out_fh ){
 		close $out_fh;
@@ -253,19 +300,24 @@ sub subcmd_sort_by_pattern ($$$$) {
 sub subcmd_detect ($$$$$$) {
 	my ($confdir, $wellknowndir, $inputdir, $anomalydir, $eventdir, $redirecteddir) = @_;
 	print "detecting.";
-	my $conffile = "$confdir/anomalymonitor.conf";
-	my $conf     = Foucault::Configuration->new;
-	my $monitor  = Foucault::Monitor->new;
+	my $conffile  = "$confdir/anomalymonitor.conf";
+	my $conf      = Foucault::Configuration->new;
+	my $monitor   = Foucault::Monitor->new;
+	my $wellknown = Foucault::WellKnown->new;
 
 	$conf->read_anomalymonitor_conf( $conffile, $wellknowndir );
 	my @rules = $conf->get_anomalymonitor_rules;
 	$monitor->set_anomalymonitor_rules( @rules );
+	$monitor->set_wellknown( $wellknown );
+	$wellknown->set_path_of_wellknowndir( $wellknowndir );
 
 	my @list = listup_dir $inputdir;
 	foreach my $f ( @list ){
 		print ".";
 		next unless $f =~ m"^(.+)\.ndjson$";
 		my $pattern = $1;
+
+		$wellknown->read_patternregexp_file_of( $pattern );
 		open my $in_fh,         "<",  "$inputdir/$f" or die;
 		open my $anomaly_fh,    ">>", "$anomalydir/$f" or die;
 		open my $event_fh,      ">>", "$eventdir/$f" or die;
@@ -318,7 +370,7 @@ sub subcmd_classify ($$$) {
 	my ($confdir, $inputdir, $outputdir) = @_;
 	print "classifing.";
 	my $wellknown = Foucault::WellKnown->new;
-	$wellknown->set_wellknowndir( $confdir );
+	$wellknown->set_path_of_wellknowndir( $confdir );
 
 	my @list = listup_dir $inputdir;
 	foreach my $f ( @list ){
@@ -550,7 +602,7 @@ sub subcmd_tabulate_anomalies ($$$) {
 sub subcmd_build_statsdir ($) {
 	my ($dir) = @_;
 	subcmd_sort_by_tag
-		"$dir/source",
+		"$dir/sources",
 		"$dir/1-1_collection_by_tag";
 	subcmd_concat
 		"$dir/1_concatination_setting",
@@ -591,6 +643,16 @@ sub subcmd_build_statsdir ($) {
 		"$dir/5-4_classified_by_equivalence";
 }
 
+sub subcmd_compile_statsdir ($) {
+	my ($dir) = @_;
+	subcmd_compile
+		"$dir/2_monitoring_setting",
+		"$dir/4_classification_setting",
+		"$dir/samples",
+		"$dir/additional_samples",
+		"$dir/3_detection_setting";
+}
+
 STDOUT->autoflush(1);
 if    ( $ARGV[0] eq 'create' ){
 	subcmd_create_statsdir $ARGV[1];
@@ -601,6 +663,9 @@ if    ( $ARGV[0] eq 'create' ){
 }elsif( $ARGV[0] eq 'build' ){
 	subcmd_build_statsdir $ARGV[1];
 
+}elsif( $ARGV[0] eq 'compile' ){
+	subcmd_compile_statsdir $ARGV[1];
+
 }else{
 	print	"usage: % $0 ACTION\n",
 		"\n",
@@ -608,6 +673,7 @@ if    ( $ARGV[0] eq 'create' ){
 		"	create DIR\n",
 		"	cleanup DIR\n",
 		"	build DIR\n",
+		"	compile DIR\n",
 		"\n";
 	exit 0;
 }

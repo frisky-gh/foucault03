@@ -16,6 +16,8 @@ sub new ($) {
 		'errorlogger'  => undef,
 		'tracelogger'  => undef,
 
+		'wellknown'    => undef,
+
 		'anomalymonitor_rules'                            => [],
 		'anomalymonitor_rulecache'                        => {},
 
@@ -62,6 +64,11 @@ sub tracelog ($$;@) {
 
 ####
 
+sub set_wellknown ($$) {
+	my ( $this, $wellknown ) = @_;
+	$$this{wellknown} = $wellknown;
+}
+
 sub set_anomalymonitor_rules ($@) {
 	my ( $this, @rules ) = @_;
 	@{ $$this{anomalymonitor_rules} } = @rules;
@@ -71,6 +78,7 @@ sub get_anomalymonitor_rule ($$) {
 	my ($this, $tag) = @_;
 	my $rules = $$this{anomalymonitor_rules};
 	my $cache = $$this{anomalymonitor_rulecache};
+	my $wellknown = $$this{wellknown};
 
 	if( exists $$cache{$tag} ){ return @{$$cache{$tag}}; }
 
@@ -78,20 +86,18 @@ sub get_anomalymonitor_rule ($$) {
 		my $name           = $$rule{name};
 		my $targets        = $$rule{targets};
 		my $pattern        = $$rule{pattern};
-		my $pattern_regexp = $$rule{pattern_regexp};
 		my $redirects      = $$rule{redirects};
-		foreach my $target ( @$targets ){
-			next unless $tag =~ m"$target";
+		my ($hit, %captured) = capture_by_regexps $tag, $targets, undef, 1;
+		next unless $hit;
+		$this->infolog("get_anomalymonitor_rule: $tag => $name");
+		my $patternregexp = $wellknown->get_patternregexp_of( $pattern );
 
-			my $captures_from_tag = { %+ };
-			$this->infolog("get_anomalymonitor_rule: $tag => $name");
-
-			@{$$cache{$tag}} = ($name, $pattern, $pattern_regexp, $redirects, $captures_from_tag);
-			return @{$$cache{$tag}};
-		}
+		my $r = [ $name, $pattern, $patternregexp, $redirects, \%captured ];
+		$$cache{$tag} = $r;
+		return @$r;
 	}
-	@{$$cache{$tag}} = (undef, undef, undef, undef, undef);
-	return undef, undef, undef, undef, undef;
+	$$cache{$tag} = [];
+	return ();
 }
 
 ####
@@ -363,6 +369,35 @@ sub monitor_all_anomalies_repeatedly ($$$$$) {
 sub check ($) {
 	my ($this) = @_;
 	return 1;
+}
+
+sub take_statistics_of_cache ($) {
+	my ($this) = @_;
+	
+	my $anomalymonitor_rulecache = $$this{anomalymonitor_rulecache};
+	my $timespan2trafficmonitor_rulecache = $$this{ttimespan2trafficmonitor_rulecache_for_threshold};
+
+	my $anomalymonitor_rulecache_keys;
+	my $anomalymonitor_rulecache_items;
+	while( my ($k, $v) = each %$anomalymonitor_rulecache ){
+		$anomalymonitor_rulecache_keys++;
+		$anomalymonitor_rulecache_items += @$v;
+	}
+	my $trafficmonitor_rulecache_keys;
+	my $trafficmonitor_rulecache_items;
+	while( my ($timespan, $trafficmonitor_rulecache) = each %$timespan2trafficmonitor_rulecache ){
+		while( my ($k, $v) = each %$trafficmonitor_rulecache ){
+			$trafficmonitor_rulecache_keys++;
+			$trafficmonitor_rulecache_items += @$v;
+		}
+	}
+
+	return (
+		'anomalymonitor_rulecache_keys'  => $anomalymonitor_rulecache_keys,
+		'anomalymonitor_rulecache_items' => $anomalymonitor_rulecache_items,
+		'trafficmonitor_rulecache_keys'  => $trafficmonitor_rulecache_keys,
+		'trafficmonitor_rulecache_items' => $trafficmonitor_rulecache_items,
+	);
 }
 
 ####

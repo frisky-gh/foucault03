@@ -15,6 +15,7 @@ use Foucault::Monitor;
 use Foucault::Filter;
 use Foucault::TrafficVolume;
 use Foucault::Volatile;
+use Foucault::WellKnown;
 
 our $REGMARK;
 
@@ -41,6 +42,7 @@ sub new ($$) {
 		'MONITOR'        => undef,
 		'FILTER'         => undef,
 		'traffic_volume' => undef,
+		'wellknown'      => undef,
 	};
 }
 
@@ -107,16 +109,20 @@ sub setup_first ($) {
 	$$this{volatile} = $volatile;
 
 	# init monitor
-	my $monitor = Foucault::Monitor->new();
+	my $monitor = Foucault::Monitor->new;
 	$$this{MONITOR} = $monitor;
 
 	# init filter
-	my $filter = Foucault::Filter->new();
+	my $filter = Foucault::Filter->new;
 	$$this{FILTER} = $filter;
 
 	# init traffic status
 	my $traffic_volume = Foucault::TrafficVolume->new( $conf->get_path_of_trafficdir );
 	$$this{traffic_volume} = $traffic_volume;
+
+	# init wellkown
+	my $wellknown = Foucault::WellKnown->new;
+	$$this{wellknown} = $wellknown;
 }
 
 sub setup_loggers ($) {
@@ -175,6 +181,10 @@ sub setup_component_loggers ($) {
 	my $traffic_volume = $$this{traffic_volume};
 	$traffic_volume->infologger ($infologger);
 	$traffic_volume->errorlogger($errorlogger);
+
+	my $wellknown = $$this{wellknown};
+	$wellknown->infologger ($infologger);
+	$wellknown->errorlogger($errorlogger);
 }
 
 sub setup_confs ($) {
@@ -194,6 +204,7 @@ sub setup_components ($) {
 	my $filter         = $$this{FILTER};
 	my $volatile       = $$this{volatile};
 	my $traffic_volume = $$this{traffic_volume};
+	my $wellknown      = $$this{wellknown};
 
 	# get commons
 	my @timespans = $conf->get_trafficmonitor_timespans;
@@ -205,6 +216,7 @@ sub setup_components ($) {
 		my @rules = $conf->get_trafficmonitor_rules( $timespan );
 		$monitor->set_trafficmonitor_rules( $timespan, @rules );
 	}
+	$monitor->set_wellknown( $wellknown );
 
 	# setup filter
 	my $concatbuffer = $volatile->get_concatbuffer;
@@ -220,6 +232,14 @@ sub setup_components ($) {
 
 	# setup traffic volume
 	$traffic_volume->set_timespans( @timespans );
+
+	# setup wellknown
+	my $wellknowndir = $conf->get_path_of_wellknowndir;
+	$wellknown->set_path_of_wellknowndir( $wellknowndir );
+	my @patterns = $conf->get_anomalymonitor_patterns;
+	foreach my $pattern ( @patterns ){
+		$wellknown->read_patternregexp_file_of( $pattern );
+	}
 }
 
 sub setup_as_tool ($) {
@@ -363,10 +383,10 @@ sub passthrough_all_concatfilters ($$$) {
 	$filter->passthrough_all_concatfilters( $tag2messages, $out_tag2concatmessages );
 }
 
-sub passthrough_all_transactionfilters ($$$) {
-	my ( $this, $redirectedmessages, $out_trxid2times ) = @_;
+sub passthrough_all_transactionfilters ($$$$$) {
+	my ( $this, $redirectedmessages, $events, $unmonitored, $out_trxid2times ) = @_;
 	my $filter = $$this{FILTER};
-	$filter->passthrough_all_transactionfilters( $redirectedmessages, $out_trxid2times );
+	$filter->passthrough_all_transactionfilters( $redirectedmessages, $events, $unmonitored, $out_trxid2times );
 }
 
 sub monitor_anomalies_repeatedly ($$$$$) {
@@ -446,6 +466,17 @@ sub keep_filter ($) {
 	my $filter   = $$this{FILTER};
 
 	$filter->keep_concatbuffer;
+}
+
+sub take_statistics_of_cache ($) {
+	my ($this) = @_;
+	my $filter  = $$this{FILTER};
+	my $monitor = $$this{MONITOR};
+
+	return (
+		$filter->take_statistics_of_cache,
+		$monitor->take_statistics_of_cache,
+	);
 }
 
 sub reload_as_parent ($) {
