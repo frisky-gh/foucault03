@@ -48,7 +48,7 @@ sub errorlog ($$;@) {
 
 sub set_report_rules ($$) {
 	my ($this, $rules) = @_;
-	$$this{attrbute_rules}      = $$rules{attribute_rules};
+	$$this{attribute_rules}     = $$rules{attribute_rules};
 	$$this{eventgrouping_rules} = $$rules{eventgrouping_rules};
 }
 

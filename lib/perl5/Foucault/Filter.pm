@@ -19,7 +19,8 @@ sub new ($) {
 		'concatfilter_rulecache'      => {},
 		'concatbuffer'                => {},
 		'concatmessages'              => {},
-		'tracsactionfilter_rulecache' => {},
+		'transactionfilter_message_rulecache' => {},
+		'transactionfilter_event_rulecache'   => {},
 	};
 }
 
@@ -61,9 +62,11 @@ sub set_concatfilter_rules ($@) {
 }
 
 sub set_transactionfilter_rules ($@) {
-	my ($this, @rules) = @_;
-	@{ $$this{transactionfilter_rules} } = @rules;
-	$$this{transactionfilter_rulecache} = {};
+	my ($this, %all_rules) = @_;
+	@{ $$this{transactionfilter_message_rules} } = @{ $all_rules{message_rules} };
+	@{ $$this{transactionfilter_event_rules} }   = @{ $all_rules{event_rules} };
+	$$this{transactionfilter_message_rulecache}  = {};
+	$$this{transactionfilter_event_rulecache}    = {};
 }
 
 ####
@@ -192,8 +195,11 @@ sub passthrough_all_concatfilters ($$$) {
 	}
 
         my $concatmessages = $$this{concatmessages};
-	while( my ($tag, $cmessages) = each %$concatmessages ){
-		push @{$$tag2cmessages{$tag}}, @$cmessages;
+	if( %$concatmessages ){
+		while( my ($tag, $cmessages) = each %$concatmessages ){
+			push @{$$tag2cmessages{$tag}}, @$cmessages;
+		}
+        	%$concatmessages = ();
 	}
 }
 
@@ -218,75 +224,124 @@ sub keep_concatbuffer ($) {
 
 ####
 
-sub passthrough_transactionfilter ($$$$) {
+sub pass_messages_through_transactionfilter ($$$$) {
 	my ($this, $tag, $cmessages, $out_trxid2times) = @_;
 
-#$this->infolog( "DEBUG08: tag: %s", $tag );
-	my @rules = $this->get_transactionfilter_rule($tag);
-	unless( @rules ){
-		return if $$this{UNMONITOREDCACHE}->{$tag};
-		$this->infolog("process_transaction_filter: unmonitored $tag");
-		$$this{UNMONITOREDCACHE}->{$tag} = 1;
-		return;
-	}
+	my @rules = $this->get_transactionfilter_message_rule($tag);
+	return unless @rules;
 
-#$this->infolog( "DEBUG09: tag: %s", $tag );
-	foreach my $m ( @$cmessages ){
+	foreach my $message ( @$cmessages ){
 		foreach my $rule ( @rules ){
-			my ($name, $output, $message_patterns, $captures) = @$rule;
-			#$this->infolog( "DEBUG10: $tag => $m" );
+			my ($name, $output, $if_message_matches, $captured) = @$rule;
 
-			my %captures = %$captures;
-			foreach my $message_pattern ( @$message_patterns ){
-				$m =~ $message_pattern or next;
-				while( my ($k, $v) = each %+ ){
-					$captures{$k} = $v;
-				}
-			}
-			my $t = expand_named_placeholders $output, %captures;
-			#$this->infolog( "DEBUG11: $output => $t" );
-			$$out_trxid2times{$t}++;
+			my ($hit, %captured_from_message) = capture_by_regexps $message, $if_message_matches, 1;
+			next unless $hit;
+
+			my %captured = ( %$captured, %captured_from_message );
+			my $trxid = expand_named_placeholders $output, %captured;
+			$$out_trxid2times{$trxid}++;
 		}
 	}
 }
 
-sub passthrough_all_transactionfilters ($$$) {
-	my ($this, $tag2cmessages, $out_trxid2times) = @_;
-	while( my ($tag, $cmessages) = each %$tag2cmessages ){
-		$this->passthrough_transactionfilter( $tag, $cmessages, $out_trxid2times );
+sub pass_event_through_transactionfilter ($$$$$$) {
+	my ($this, $event, $pattern, $tag, $message, $out_trxid2times) = @_;
+
+	my @rules = $this->get_transactionfilter_event_rule($event, $pattern, $tag);
+	return unless @rules;
+
+	foreach my $rule ( @rules ){
+		my ($name, $output, $if_message_matches, $captured) = @$rule;
+
+		my ($hit, %captured_from_message) = capture_by_regexps $message, $if_message_matches, 1;
+		next unless $hit;
+
+		my %captured = ( %$captured, %captured_from_message );
+		my $trxid = expand_named_placeholders $output, %captured;
+		$$out_trxid2times{$trxid}++;
 	}
 }
 
-sub get_transactionfilter_rule ($$) {
+sub passthrough_all_transactionfilters ($$$$$) {
+	my ($this, $tag2cmessages, $events, $unmonitored, $out_trxid2times) = @_;
+	while( my ($tag, $cmessages) = each %$tag2cmessages ){
+		$this->pass_messages_through_transactionfilter( $tag, $cmessages, $out_trxid2times );
+	}
+	foreach my $event ( @$events ){
+		my $eventname = $$event{event};
+		my $pattern   = $$event{pattern};
+		my $tag       = $$event{tag};
+		my $message   = $$event{message};
+		$this->pass_event_through_transactionfilter( $eventname, $pattern, $tag, $message, $out_trxid2times );
+	}
+	foreach my $event ( @$unmonitored ){
+		my $eventname = $$event{event};
+		my $pattern   = $$event{pattern};
+		my $tag       = $$event{tag};
+		my $message   = $$event{message};
+		$this->pass_event_through_transactionfilter( $eventname, $pattern, $tag, $message, $out_trxid2times );
+	}
+}
+
+sub get_transactionfilter_message_rule ($$) {
 	my ($this, $tag) = @_;
-	my $cache = $$this{tracsactionfilter_rulecache};
+	my $cache = $$this{transactionfilter_message_rulecache};
 
 	if( exists $$cache{$tag} ){ return @{$$cache{$tag}}; }
 
-	my $rules = $$this{transactionfilter_rules};
+	my $rules = $$this{transactionfilter_message_rules};
 	my @result;
 	foreach my $rule ( @$rules ){
 		my $name   = $$rule{name};
-		my $inputs = $$rule{inputs};
 		my $output = $$rule{output};
-		my $tag_patterns     = $$rule{tag_patterns};
-		my $message_patterns = $$rule{message_patterns};
-		foreach my $input ( @$inputs ){
-			next unless $tag =~ m"$input";
+		my $if_tag_matches     = $$rule{input_if_tag_matches};
+		my $if_message_matches = $$rule{input_if_message_matches};
 
-			$this->infolog("get_transactionfilter_rule: $tag => $name => $output");
-			my $captures = {};
-			foreach my $tag_pattern ( @$tag_patterns ){
-				$tag =~ m"$tag_pattern" or next;
-				while( my ($k, $v) = each %+ ){
-					$$captures{$k} = $v;
-					$this->infolog("get_transactionfilter_rule:     capture: <$k> => $v");
-				}
-			}
-			push @result, [$name, $output, $message_patterns, $captures];
+		my ($hit, %captured_from_tag) = capture_by_regexps $tag, $if_tag_matches, 1;
+		next unless $hit;
+		$this->infolog("get_transactionfilter_message_rule: $tag => $name => $output");
+		my %captured = ( %captured_from_tag );
+		while( my ($k, $v) = each %captured ){
+			$this->infolog("get_transactionfilter_message_rule:     captured: %s => %s", $k, $v);
 		}
+
+		push @result, [$name, $output, $if_message_matches, \%captured];
 	}
 	$$cache{$tag} = \@result;
+	return @result;
+}
+
+sub get_transactionfilter_event_rule ($$$$) {
+	my ($this, $event, $pattern, $tag) = @_;
+	my $cache = $$this{transactionfilter_event_rulecache};
+
+	if( exists $$cache{$event,$pattern,$tag} ){ return @{$$cache{$event,$pattern,$tag}}; }
+
+	my $rules = $$this{transactionfilter_event_rules};
+	my @result;
+	foreach my $rule ( @$rules ){
+		my $name   = $$rule{name};
+		my $output = $$rule{output};
+		my $if_event_matches   = $$rule{input_if_event_matches};
+		my $if_pattern_matches = $$rule{input_if_pattern_matches};
+		my $if_tag_matches     = $$rule{input_if_tag_matches};
+		my $if_message_matches = $$rule{input_if_message_matches};
+
+		my ($hit, %captured_from_event)   = capture_by_regexps $event,   $if_event_matches,   1;
+		next unless $hit;
+		my ($hit, %captured_from_pattern) = capture_by_regexps $pattern, $if_pattern_matches, 1;
+		next unless $hit;
+		my ($hit, %captured_from_tag)     = capture_by_regexps $tag,     $if_tag_matches,     1;
+		next unless $hit;
+		$this->infolog("get_transactionfilter_event_rule: $event,$pattern,$tag => $name => $output");
+		my %captured = ( %captured_from_event, %captured_from_pattern, %captured_from_tag );
+		while( my ($k, $v) = each %captured ){
+			$this->infolog("get_transactionfilter_event_rule:     captured: %s => %s", $k, $v);
+		}
+
+		push @result, [$name, $output, $if_message_matches, \%captured];
+	}
+	$$cache{$event,$pattern,$tag} = \@result;
 	return @result;
 }
 
@@ -295,6 +350,54 @@ sub get_transactionfilter_rule ($$) {
 sub check ($) {
 	my ($this) = @_;
 	return 1;
+}
+
+sub take_statistics_of_cache ($) {
+	my ($this) = @_;
+	
+	my $concatfilter_rulecache = $$this{concatfilter_rulecache};
+	my $concatbuffer = $$this{concatbuffer};
+	my $transactionfilter_message_rulecache = $$this{transactionfilter_message_rulecache};
+	my $transactionfilter_event_rulecache   = $$this{transactionfilter_event_rulecache};
+
+	my $concatfilter_rulecache_keys;
+	my $concatfilter_rulecache_items;
+	while( my ($k, $v) = each %$concatfilter_rulecache ){
+		$concatfilter_rulecache_keys++;
+		$concatfilter_rulecache_items += @$v;
+	}
+	my $concatbuffer_keys;
+	my $concatbuffer_volume;
+	while( my ($k, $v) = each %$concatbuffer ){
+		$concatbuffer_keys++;
+		my $fracture = $$v{fracture};
+		foreach my $i ( @$fracture ){
+			$concatbuffer_volume += length $i;
+		}
+	}
+	my $transactionfilter_message_rulecache_keys;
+	my $transactionfilter_message_rulecache_items;
+	while( my ($k, $v) = each %$transactionfilter_message_rulecache ){
+		$transactionfilter_message_rulecache_keys++;
+		$transactionfilter_message_rulecache_items += @$v;
+	}
+	my $transactionfilter_event_rulecache_keys;
+	my $transactionfilter_event_rulecache_items;
+	while( my ($k, $v) = each %$transactionfilter_event_rulecache ){
+		$transactionfilter_event_rulecache_keys++;
+		$transactionfilter_event_rulecache_items += @$v;
+	}
+
+	return (
+		'concatfilter_rulecache_keys'  => $concatfilter_rulecache_keys,
+		'concatfilter_rulecache_items' => $concatfilter_rulecache_items,
+		'concatbuffer_keys'  => $concatbuffer_keys,
+		'concatbuffer_volume' => $concatbuffer_volume,
+		'transactionfilter_message_rulecache_keys'  => $transactionfilter_message_rulecache_keys,
+		'transactionfilter_message_rulecache_items' => $transactionfilter_message_rulecache_items,
+		'transactionfilter_event_rulecache_keys'    => $transactionfilter_event_rulecache_keys,
+		'transactionfilter_event_rulecache_items'   => $transactionfilter_event_rulecache_items,
+	);
 }
 
 ####

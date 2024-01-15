@@ -4,8 +4,9 @@ package Foucault::WellKnown;
 
 use strict;
 use English;
-use Template;
 use JSON::XS;
+use Regexp::Assemble;
+use Foucault::Common;
 
 our $REGMARK;
 
@@ -14,6 +15,8 @@ our $REGMARK;
 sub new ($) {
 	my ($class) = @_;
 	return bless {
+		'infologger'   => undef,
+		'errorlogger'  => undef,
 		'wellknowndir' => undef,
 		'rules' => {},
 	};
@@ -21,55 +24,107 @@ sub new ($) {
 
 ####
 
-sub set_wellknowndir ($$) {
+sub infologger ($;$) {
+	my ($this, $logger) = @_;
+	return $$this{'infologger'} unless defined $logger;
+	$$this{'infologger'} = $logger;
+}
+
+sub errorlogger ($;$) {
+	my ($this, $logger) = @_;
+	return $$this{'errorlogger'} unless defined $logger;
+	$$this{'errorlogger'} = $logger;
+}
+
+sub infolog ($$;@) {
+	my ($this, $format, @params) = @_;
+	$$this{'infologger'}->write( $format, @params ) if defined $$this{'infologger'};
+}
+
+sub errorlog ($$;@) {
+	my ($this, $format, @params) = @_;
+	$$this{'errorlogger'}->write( $format, @params ) if defined $$this{'errorlogger'};
+}
+
+#### Setup functions
+
+sub set_path_of_wellknowndir ($$) {
 	my ( $this, $d ) = @_;
 	die "$d: is not directory, stopped" unless -d $d;
 	$$this{wellknowndir} = $d;
 }
 
-####
+#### I/O functions
 
-sub quotemetaex ($) {
-	local $_ = shift;
-	s{([\x24\x28-\x2b\x2e\x3f\x5b-\x5e\x7b-\x7d])}{\\$1}g;
-	return $_;
-}
-
-####
-
-sub read_regexpfile ($$) {
-	my ( $this, $f ) = @_;
-	open my $h, '<', $f or do {
-		print "read_regexpfile: $f: cannot read.\n";
-		return undef, undef;
-	};
-	my ($dev, $ino, $mode, $nlink, $uid, $gid, $rdev, $size,
-	    $atime, $mtime, $ctime, $blksize, $blocks) = stat $h;
-	my $regexp = join '', <$h>;
-	chomp $regexp;
-	close $h;
-	my $regexp_compiled;
-	eval {
-		$regexp_compiled = qr"^$regexp$";
-	};
-	unless( defined $regexp_compiled ){
-		print "read_regexpfile: $f: cannot compile.\n";
-		return undef, undef;
-	}
-	return $regexp_compiled, $mtime;
-}
-
-sub read_rulefile ($$) {
-	my ($this, $patternname) = @_;
-	my $rules        = $$this{rules};
+sub read_patternregexp_file_of ($$) {
+	my ( $this, $pattern ) = @_;
 	my $wellknowndir = $$this{wellknowndir};
-	my $conffile = "$wellknowndir/$patternname.rules";
+	my $f = "$wellknowndir/$pattern.regexp";
+	open my $h, '<', $f or do {
+		print "read_patternregexp_file_of: $f: cannot read.\n";
+		return undef;
+	};
+	my $mtime = mtime_of_fh $h;
+	my $regexp_text = join '', <$h>;
+	chomp $regexp_text;
+	close $h;
+	my $regexp;
+	eval { $regexp = qr"^$regexp_text$"; };
+	unless( defined $regexp ){
+		print "read_patternregexp_file_of: $f: cannot compile.\n";
+		return undef;
+	}
+
+	$$this{patternregexps}->{$pattern} = {
+		'file'      => $f,
+		'mtime'     => $mtime,
+		'regexp'    => $regexp,
+		'diagnosis' => undef,
+	};
+	return 1;
+}
+
+sub write_patternregexp_file_of ($$) {
+	my ( $this, $pattern ) = @_;
+	my $wellknowndir = $$this{wellknowndir};
+	my $regexp = $$this{patternregexps}->{$pattern}->{regexp};
+
+	my $f = "$wellknowndir/$pattern.regexp";
+	open my $h, '>', $f or do {
+		print "write_patternregexp_file_of: $f: cannot write.\n";
+		return undef;
+	};
+	print $h "$regexp\n";
+	close $h;
+
+	$$this{patternregexps}->{$pattern}->{file}  = $f;
+	$$this{patternregexps}->{$pattern}->{mtime} = time;
+	return 1;
+}
+
+sub create_patternregexp_file_of ($$) {
+	my ( $this, $pattern ) = @_;
+	my $wellknowndir = $$this{wellknowndir};
+	my $src = "$wellknowndir/template_of_regexp";
+	my $dst = "$wellknowndir/$pattern.regexp";
+	system "cp -p \"$src\" \"$dst\"";
+	$this->read_patternregexp_file_of($pattern);
+}
+
+sub read_generalizerules_file_of ($$) {
+	my ( $this, $pattern ) = @_;
+	my $wellknowndir = $$this{wellknowndir};
+	my $f = "$wellknowndir/$pattern.rules";
+	open my $h, '<', $f or do {
+		print "read_generalizerules_file_of: $f: cannot read.\n";
+		return undef;
+	};
+	my $mtime = mtime_of_fh $h;
 
 	my $mark = "rule0000";
 	my $lastmark;
 	my %mark2replace;
-	my @res;
-	open my $h, '<', $conffile or die "$conffile: cannot open, stopped";
+	my @regexps;
 	while( <$h> ){
 		chomp;
 		s{^\s*}{}g;
@@ -79,11 +134,11 @@ sub read_rulefile ($$) {
 			my $pattern = $2;
 			eval { qr"$pattern"; };
 			unless( $@ eq "" ){
-				print STDERR "$conffile:$.: syntax error. \n";
-				print STDERR "$conffile:$.: $@\n";
+				$this->errorlog( "$f:$.: syntax error." );
+				$this->errorlog( "$f:$.: %s", $@ );
 				next;
 			}
-			push @res, "$pattern(*:$mark)";
+			push @regexps, "$pattern(*:$mark)";
 			$mark2replace{$mark} = $pattern;
 			$lastmark = $mark;
 			$mark++;
@@ -91,41 +146,157 @@ sub read_rulefile ($$) {
 			my $pattern = $2;
 			eval { qr"$pattern"; };
 			unless( $@ eq "" ){
-				print STDERR "$conffile:$.: syntax error. \n";
-				print STDERR "$conffile:$.: $@\n";
+				$this->errorlog( "$f:$.: syntax error." );
+				$this->errorlog( "$f:$.: %s", $@ );
 				next;
 			}
 			$mark2replace{$lastmark} = $pattern;
 		}else{
-			die "$conffile:$.: illegal format, stopped";
+			die "$f:$.: illegal format, stopped";
 		}
 	}
 	close $h;
-	my $re = "(" . join("|", @res) . ")";
+	my $regexp_text = "(" . join("|", @regexps) . ")";
+	my $regexp;
+	eval { $regexp = qr"$regexp_text"; };
+	unless( defined $regexp ){
+		print "read_generalizerules_file_of: $f: cannot compile.\n";
+		return undef;
+	}
 
-	$$rules{$patternname} = {
-		conffile     => $conffile,
-		regexp       => qr"$re",
-		mark2replace => \%mark2replace,
+	$$this{generalizerules}->{$pattern} = {
+		'file'         => $f,
+		'mtime'        => $mtime,
+		'regexp'       => $regexp,
+		'mark2replace' => \%mark2replace,
 	};
+	return 1;
 }
 
-sub read_patternfile ($$) {
-	my ($this, $patternname) = @_;
+sub create_generalizerules_file_of ($$) {
+	my ( $this, $pattern ) = @_;
 	my $wellknowndir = $$this{wellknowndir};
-	my $conffile = "$wellknowndir/$patternname.regexp";
-
-	open my $h, '<', $conffile or die "$conffile: cannot open, stopped";
-	my $pattern = join '', <$h>;
-	close $h;
-	chomp $pattern;
-	return qr"^$pattern$";
+	my $src = "$wellknowndir/template_of_rules";
+	my $dst = "$wellknowndir/$pattern.rules";
+	system "cp -p \"$src\" \"$dst\"";
+	$this->read_generalizerules_file_of($pattern);
 }
 
-sub generalize ($$) {
+sub read_samples_file_of ($$) {
+	my ( $this, $pattern ) = @_;
+	my $wellknowndir = $$this{wellknowndir};
+
+	opendir my $d, $wellknowndir or do {
+		die "$wellknowndir: cannot open, stopped";
+	};
+
+	my %set_of_samples;
+	while( my $e = readdir $d ){
+		next if $e =~ m"^\.";
+		next unless -f "$wellknowndir/$e";
+		next unless $e =~ m"^([-\w]+)(?:\+([-\w]+))?\.samples$";
+		my $patternname = $1;
+		my $eventname   = $2 eq "" ? "50WELLKNOWN" : $2;
+		next unless $patternname eq $pattern;
+
+		open my $h, '<', "$wellknowndir/$e" or do {
+			print "read_regexpfile: $wellknowndir/$e: cannot read.\n";
+			return undef;
+		};
+		my $mtime = mtime_of_fh $h;
+		my @texts;
+		while( <$h> ){ chomp; push @texts, $_; }
+		close $h;
+
+		$set_of_samples{$eventname} = {
+			'event' => $eventname,
+			'file'  => "$wellknowndir/$e",
+			'mtime' => $mtime,
+			'texts' => \@texts,
+		};
+	}
+	close $d;
+
+	return undef unless %set_of_samples;
+
+	$$this{samples}->{$pattern} = \%set_of_samples;
+	return 1;
+}
+
+sub create_samples_file_of ($$) {
+	my ( $this, $pattern ) = @_;
+	my $wellknowndir = $$this{wellknowndir};
+	my $src = "$wellknowndir/template_of_samples";
+	my $dst = "$wellknowndir/$pattern.samples";
+	system "cp -p \"$src\" \"$dst\"";
+	$this->read_samples_file_of($pattern);
+}
+
+sub write_diagnosis_file_of ($$) {
+	my ( $this, $pattern ) = @_;
+	my $wellknowndir = $$this{wellknowndir};
+	my $diagnosis = $$this{patternregexps}->{$pattern}->{diagnosis};
+
+	my $f = "$wellknowndir/$pattern.diagnosis";
+	open my $h, '>', $f or do {
+		print "write_patternregexp_file_of: $f: cannot write.\n";
+		return undef;
+	};
+	my $encoder = JSON::XS->new->pretty(1)->indent(4)->space_after(1)->canonical(1);
+	my $diagnosis_json = $encoder->encode($diagnosis);
+
+	print $h "$diagnosis_json\n";
+	close $h;
+	return 1;
+}
+
+####
+
+sub get_patternregexp_of ($$) {
+	my ( $this, $pattern ) = @_;
+	my $regexp = $$this{patternregexp}->{$pattern}->{regexp};
+	return $$this{patternregexps}->{$pattern}->{regexp};
+}
+
+sub get_mtime_of_patternregexp_of ($$) {
+	my ( $this, $pattern ) = @_;
+	return $$this{patternregexps}->{$pattern}->{mtime};
+}
+
+sub get_generalizeregexp_of ($$) {
+	my ( $this, $pattern ) = @_;
+	return $$this{generalizerules}->{$pattern}->{regexp};
+}
+
+sub get_mtime_of_generalizeregexp_of ($$) {
+	my ( $this, $pattern ) = @_;
+	return $$this{generalizerules}->{$pattern}->{mtime};
+}
+
+sub get_samples_of ($$) {
+	my ( $this, $pattern ) = @_;
+	return $$this{samples}->{$pattern};
+}
+
+sub get_mtime_of_samples_of ($$) {
+	my ( $this, $pattern ) = @_;
+
+	my $set_of_samples = $$this{samples}->{$pattern};
+	return undef unless defined $set_of_samples;
+
+	my $latest_mtime;
+	while( my ($eventname, $samples) = each %$set_of_samples ){
+		$latest_mtime = $$samples{mtime} if $$samples{mtime} > $latest_mtime;
+	}
+	return $latest_mtime;
+}
+
+####
+
+sub generalize ($$$) {
 	my ($this, $patternname, $sample) = @_;
-	my $rule = $$this{rules}->{$patternname};
-	die unless defined $rule;
+	my $rule = $$this{generalizerules}->{$patternname};
+	die "$patternname: not defined, stopped" unless defined $rule;
 
         my $rule_regexp  = $$rule{regexp};
 	my $mark2replace = $$rule{mark2replace};
@@ -140,140 +311,82 @@ sub generalize ($$) {
         return $generalized;
 }
 
-####
+sub compile_as_fracture ($$$$) {
+	my ($this, $pattern, $samples, $out_diagnosis) = @_;
+	my $file  = $$samples{file};
+	my $event = $$samples{event};
+	my $texts = $$samples{texts};
 
-#### test confs
+	my $optimize = 1;
+	my $ra = Regexp::Assemble->new;
 
-sub add_sample ($$$$) {
-        my ($stats, $sample, $pattern_fracture, $unixtime) = @_;
-        my $samples         = $$stats{samples};
-        my $fracture2sample = $$stats{fracture2sample};
+	my %generalized_text_cache;
+	my @generalized_texts;
+	my @generalized_regexps;
 
-        if    ( $$samples{$sample} ){
-                # nothing to do
-        }elsif( my $s = $$fracture2sample{$pattern_fracture} ){
-		my $i = $$samples{$s};
-                $$i{total}++;
-        }else{
-		eval { qr"$pattern_fracture"; };
-                if( $@ ){
-                	print STDERR "ERROR: invalid pattern fracture\n",
-				"       $samples\n",
-				"       $pattern_fracture\n";
+	my $linenum = 0;
+	foreach my $text ( @$texts ){
+		$linenum++;
+
+		next if $text =~ m"^\s*$";
+		next if $text =~ m"^\s*#";
+
+		my $generalized_text = $this->generalize($pattern, $text);
+		next if $generalized_text_cache{$generalized_text};
+		next if match_regexps $text, \@generalized_regexps;
+
+		eval {
+			my $regexp = qr"^$generalized_text$";
+			push @generalized_texts,   $generalized_text;
+			push @generalized_regexps, $regexp;
+			$generalized_text_cache{$generalized_text} = 1;
+		};
+		if( $@ ){
+			$this->errorlog("$file:$linenum: cannot compile.");
+			die "$file:$linenum: cannot compile, stopped";
 		}
-                $$samples{$sample} = {
-			pattern_fracture => $pattern_fracture,
-                unixtime => $unixtime,
-                total => 1,
-                };
-                $$fracture2sample{$pattern_fracture} = $sample;
-                return 1;
+
+		$ra->add( $generalized_text ) if $optimize;
+		push @$out_diagnosis, {
+			"pattren"     => $pattern,
+			"event"       => $event,
+			"file"        => $file,
+			"linenum"     => $linenum,
+			"sample"      => $text,
+			"generalized" => $generalized_text,
+		}
 	}
-	return undef;
+
+	my $regexp = $optimize ? $ra : "(?:" . join('|', @generalized_texts) . ")";
+	return "$regexp(*:$event)";
 }
 
-sub get_mtime ($) {
-	my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,
-	    $atime,$mtime,$ctime,$blksize,$blocks) = stat $_[0];
-	return $mtime;
-}
+sub compile ($$) {
+	my ($this, $pattern) = @_;
 
-#### sub-commands
+	my $generalize_regexp = $this->get_generalizeregexp_of( $pattern );
+	my $set_of_samples    = $this->get_samples_of( $pattern );
+	my $diagnosis         = [];
 
-sub build_patterns ($) {
-	my ($this) = @_;
-	my $WELLKNOWNSDIR = $$this{wellknowndir};
-	my $CONFDIR;
-	my $BINDIR;
-	opendir my $d, $WELLKNOWNSDIR or do {
-		die "$WELLKNOWNSDIR: cannot open, stopped";
-	};
-	my %mtime;
-	my %option;
-	while( my $e = readdir $d ){
-		next if $e =~ m"^\.";
-		if    ( $e =~ m"^([-\w]+)\.regexp$" ){
-			my $mtime = get_mtime "$WELLKNOWNSDIR/$e";
-			next unless $mtime > 0;
-			$mtime{$1}->{pattern} = $mtime;
-		}elsif( $e =~ m"^([-\w]+)\.rules$" ){
-			my $mtime = get_mtime "$WELLKNOWNSDIR/$e";
-			next unless $mtime > 0;
-			$mtime{$1}->{src} = $mtime if
-				not defined($mtime{$1}->{src}) or
-				$mtime > $mtime{$1}->{src};
-		}elsif( $e =~ m"^([-\w]+)(?:\+([-\w]+))?\.samples$" ){
-			my $mtime = get_mtime "$WELLKNOWNSDIR/$e";
-			next unless $mtime > 0;
-			$mtime{$1}->{src} = $mtime if
-				not defined($mtime{$1}->{src}) or
-				$mtime > $mtime{$1}->{src};
-			push @{ $option{$1} }, $2 if $2;
-		}
-	}
-	close $d;
-
-	while( my ($k, $v) = each %mtime ){
-		my $samplefile	  = "$WELLKNOWNSDIR/$k.samples";
-		my $rulefile	  = "$WELLKNOWNSDIR/$k.rules";
-		my $regexpfile	  = "$WELLKNOWNSDIR/$k.regexp";
-		my $diagnosisfile = "$WELLKNOWNSDIR/$k.diagnosis";
-		
-		my $cmd;
-		unless( -f $samplefile ){
-		        $cmd .= "cp /dev/null $samplefile ;";
-		        print "$samplefile: created.\n";
-		}
-		unless( -f $rulefile ){
-		        $cmd .= "cp $CONFDIR/rules.template $rulefile ;";
-		        print "$rulefile: created.\n";
-		}
-		next if -f $regexpfile and $$v{src} < $$v{pattern};
-		$cmd .= "$BINDIR/panopticfilter build";
-		$cmd .= " -r $rulefile -d $diagnosisfile";
-		$cmd .= " -o $regexpfile -f $samplefile";
-		foreach my $i ( @{$option{$k} // []} ){
-			$cmd .= " -e $i -f $WELLKNOWNSDIR/$k+$i.samples";
-		}
-		system "$cmd\n";
+	my @regexp_fractures;
+	foreach my $eventname ( sort keys %$set_of_samples ){
+		my $samples = $$set_of_samples{$eventname};
+		my $regexp_fracture = $this->compile_as_fracture($pattern, $samples, $diagnosis);
+		push @regexp_fractures, $regexp_fracture;
 	}
 
-	exit 0;
-}
-
-sub cmd_analyze ($$$$) {
-	my ($this, $rulefile, $patternfile, $diagnosisfile, $statisticsfile) = @_;
-	$| = 1;
-	my ($rule_re, %mark2replace) = $this->read_rulefile( $rulefile );
-	my $regexp = $this->read_patternfile( $patternfile ) if defined $patternfile;
-	my $now = time;
-
-	my $decoder = JSON::XS->new;
-	while(<STDIN>){
-		chomp;
-		next if m"^\s*(#|$)";
-
-		utf8::decode($_);
-		my $obj = encode_obj $decoder->decode( $_ );
-		my $unixtime = $$obj{unixtime};
-		my $message  = $$obj{message};
-
-		next if $message =~ m"^\s*(#|$)";
-		next if defined $regexp and $message =~ m"$regexp"  && $+[0] == length($message);
-
-		my $pattern_fracture = $this->generalize("pattern", $message);
-		my $r = $this->add_sample( $message, $pattern_fracture, $unixtime );
-		next unless $r;
-
-		#print $diagnosisfh "$pattern_fracture\n" if $diagnosisfh;
-
+	my $regexp = "(" . join("|", @regexp_fractures) . ")";
+	eval { qr"$regexp"; };
+	if( $@ ){
+		die;
 	}
-	#write_statisticsfile $statisticsfile, $stats;
-	exit 0;
+	
+	$$this{patternregexps}->{$pattern}->{regexp} = $regexp;
+	$$this{patternregexps}->{$pattern}->{mtime}  = time;
+	$$this{patternregexps}->{$pattern}->{diagnosis} = $diagnosis;
 }
 
 ####
 
 1;
 
- 

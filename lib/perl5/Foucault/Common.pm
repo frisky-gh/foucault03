@@ -3,8 +3,10 @@ package Foucault::Common;
 
 use Exporter import;
 our @EXPORT = (
-	'expand_path',
+	'expand_time_placeholders',
 	'expand_named_placeholders',
+	'quotemetaex',
+	'mtime_of_fh',
 	'timestamp',
 	'unixtime2timestring',
 	'timestring2unixtime',
@@ -21,6 +23,8 @@ our @EXPORT = (
 	'rsync_or_die',
 	'link_or_die',
 	'match_regexps',
+	'capture_by_regexps',
+	'capture_all_by_regexps',
 	'common_set',
 );
 
@@ -38,7 +42,7 @@ our $SENDMAIL_EXE = '/usr/lib/sendmail';
 
 #### string functions
 
-sub expand_path ($) {
+sub expand_time_placeholders ($) {
 	my ($t) = @_;
 	my ($sec, $min, $hour, $day, $mon, $year) = localtime;
 	$t =~ s{(%[ymdHMS]|\~)}{
@@ -59,6 +63,18 @@ sub expand_named_placeholders ($\%) {
 		$$captures{$1};
 	}eg;
 	return $t;
+}
+
+sub quotemetaex ($) {
+	local $_ = shift;
+	s{([\x24\x28-\x2b\x2e\x3f\x5b-\x5e\x7b-\x7d])}{\\$1}g;
+	return $_;
+}
+
+sub mtime_of_fh ($) {
+	my ($fh) = @_;
+	my ($dev, $ino, $mode, $nlink, $uid, $gid, $rdev, $size, $atime, $mtime, $ctime, $blksize, $blocks) = stat $fh;
+	return $mtime;
 }
 
 sub timestamp () {
@@ -208,6 +224,38 @@ sub match_regexps ($$;$) {
 		return 1 if $text =~ $regexp;
 	}
 	return undef;
+}
+
+sub capture_by_regexps ($$;$$) {
+	my ($text, $regexps, $if_undefined, $stop_at_first_hit) = @_;
+	return $if_undefined unless defined $regexps;
+	return $if_undefined unless @$regexps;
+	my @captured;
+	my $hit = undef;
+	foreach my $regexp ( @$regexps ){
+		next unless $text =~ $regexp;
+		$hit = 1;
+		push @captured, %+;
+		last if $stop_at_first_hit;
+	}
+	return $hit, @captured;
+}
+
+sub capture_all_by_regexps ($$;$$) {
+	my ($text, $regexps, $if_undefined, $stop_at_first_hit) = @_;
+	return $if_undefined unless defined $regexps;
+	return $if_undefined unless @$regexps;
+	my %captured;
+	my $hit = undef;
+	foreach my $regexp ( @$regexps ){
+		next unless $text =~ $regexp;
+		$hit = 1;
+		while( my ($k, $v) = each %- ){
+			foreach my $i ( @$v ){ next if $i eq ""; $captured{$k} = $i; };
+		}
+		last if $stop_at_first_hit;
+	}
+	return $hit, %captured;
 }
 
 sub common_set ($$) {
