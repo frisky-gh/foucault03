@@ -1,0 +1,41 @@
+
+
+#### Address
+replace	(?:\d+\.\d+\.\d+\.\d+)
+replace	(?:fe80:(?:[0-9a-f]{4}){3}/64)
+replace	(?:(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})
+
+#### Waiting Time
+replace	(?:\d+(:?\.\d+)?(?:min \d+\.\d+s|s|ms))
+replace	(?:\.\.\.+)
+  with	(?:\.\.+)
+
+#### Timestamp
+replace	(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{6})?\+\d{2}:\d{2})
+  with	(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+\d{2}:\d{2}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\x20[\x200-9][0-9]\x20[\x200-9][0-9]:[0-9][0-9]:[0-9][0-9]|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}\+\d{2}:\d{2})
+replace	((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s[\s0-9][0-9]\s[\s0-9][0-9]:[0-9][0-9]:[0-9][0-9])
+  with	(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+\d{2}:\d{2}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\x20[\x200-9][0-9]\x20[\x200-9][0-9]:[0-9][0-9]:[0-9][0-9]|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}\+\d{2}:\d{2})
+replace	(?:\d{4}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2})
+replace	(?:\d{4}-\d{2}-\d{2}.\d{2}:\d{2}:\d{2}(?:[.:]\d{3})?)
+replace	(?:\d{2}/(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/\d{4}:\d{2}:\d{2}:\d{2}\s[-+]\d{4})
+replace	(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat)\s(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s\d{2}\s\d{2}:\d{2}:\d{2}\.\d{6}\s\d{4}
+replace	(?:\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})
+replace	(?:server: \d+ \d+, \d+ \d+:\d+:\d+ (?:\xb8\xe1\xb8\xe5|\xb8\xe1\xc1\xb0|午後|午前))
+
+#### Hexadecimal Number
+replace	(?:0x[0-9a-fA-F]+)
+replace	(?:[0-9a-fA-F]{4,}-[0-9a-fA-F]{4,})
+replace	(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})
+replace	(?:[fF]{4,})
+  with	[0-9a-fA-F]{4,}
+
+#### Version Number
+replace	(?:v\d+\.\d+\.\d+(-[-.\w]+)?)
+
+#### Number
+replace	(?:\d{2,}\.\d+)
+replace	(?:\d{2,})
+  with	\d+
+
+
+
